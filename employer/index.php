@@ -29,6 +29,13 @@ if ($empRow) {
     $coStmt->execute([':id' => $companyId]);
     $company = $coStmt->fetch();
 }
+// Lấy danh sách chi nhánh của công ty
+$branches = [];
+if ($companyId) {
+    $branchStmt = $pdo->prepare('SELECT id, branch_name, full_address, address_detail, province, is_headquarter FROM company_branches WHERE company_id = :cid ORDER BY is_headquarter DESC, id ASC');
+    $branchStmt->execute([':cid' => $companyId]);
+    $branches = $branchStmt->fetchAll();
+}
 
 // -----------------------------------------------------------------------------
 // Xử lý các action POST
@@ -73,6 +80,8 @@ try {
             $salaryMin   = strlen(trim((string)($_POST['salary_min'] ?? ''))) > 0 ? (float)$_POST['salary_min'] : null;
             $salaryMax   = strlen(trim((string)($_POST['salary_max'] ?? ''))) > 0 ? (float)$_POST['salary_max'] : null;
             $categoryIds = is_array($_POST['categories'] ?? null) ? $_POST['categories'] : [];
+            $branchId = (int)($_POST['branch_id'] ?? 0);
+            if ($branchId <= 0) $branchId = null;
 
             if ($title === '') throw new RuntimeException('Tiêu đề việc làm là bắt buộc.');
             if (empty($_FILES['image']['name']) || ($_FILES['image']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
@@ -83,10 +92,11 @@ try {
             $pdo->beginTransaction();
             try {
                 $pdo->prepare('
-                    INSERT INTO jobs (company_id, title, description, requirement, salary, location, image, status, salary_min, salary_max)
-                    VALUES (:company_id, :title, :description, :requirement, :salary, :location, :image, "pending", :salary_min, :salary_max)
-                ')->execute([
+                    INSERT INTO jobs (company_id, branch_id, title, description, requirement, salary, location, image, status, salary_min, salary_max)
+                    VALUES (:company_id, :branch_id, :title, :description, :requirement, :salary, :location, :image, "pending", :salary_min, :salary_max)
+            ')->execute([
                     ':company_id'  => $companyId,
+                    ':branch_id'   => $branchId,
                     ':title'       => $title,
                     ':description' => $description,
                     ':requirement' => $requirement,
@@ -136,6 +146,8 @@ try {
             $salaryMin   = strlen(trim((string)($_POST['salary_min'] ?? ''))) > 0 ? (float)$_POST['salary_min'] : null;
             $salaryMax   = strlen(trim((string)($_POST['salary_max'] ?? ''))) > 0 ? (float)$_POST['salary_max'] : null;
             $categoryIds = is_array($_POST['categories'] ?? null) ? $_POST['categories'] : [];
+            $branchId = (int)($_POST['branch_id'] ?? 0);
+            if ($branchId <= 0) $branchId = null;
             // Nếu đây là "đăng lại" thì reset về pending, xóa lý do từ chối
             $isRepost    = ((int)($_POST['repost'] ?? 0)) === 1;
 
@@ -147,6 +159,7 @@ try {
                 'location'    => $location,
                 'salary_min'  => $salaryMin,
                 'salary_max'  => $salaryMax,
+                'branch_id'   => $branchId,
             ];
 
             // Nếu đăng lại: reset pending và xóa rejection_reason
@@ -288,6 +301,22 @@ foreach ($jobs as $j) {
     if (isset($jobStats[$st])) $jobStats[$st]++;
 }
 
+// Dữ liệu biểu đồ: số ứng viên theo từng job (top 10)
+$chartJobsData = [];
+if ($companyId) {
+    $chartStmt = $pdo->prepare('
+        SELECT j.title, COUNT(a.id) AS cnt
+        FROM jobs j
+        LEFT JOIN applications a ON a.job_id = j.id
+        WHERE j.company_id = :cid
+        GROUP BY j.id, j.title
+        ORDER BY cnt DESC
+        LIMIT 10
+    ');
+    $chartStmt->execute([':cid' => $companyId]);
+    $chartJobsData = $chartStmt->fetchAll();
+}
+
 // Dữ liệu cho trang edit job
 $editJobId         = (int)($_GET['id'] ?? 0);
 $editJob           = null;
@@ -297,8 +326,10 @@ if ($page === 'job_edit' && $editJobId > 0) {
     $stmt = $pdo->prepare('SELECT * FROM jobs WHERE id=:id AND company_id=:cid');
     $stmt->execute([':id' => $editJobId, ':cid' => $companyId]);
     $editJob = $stmt->fetch();
+    
 
     if ($editJob) {
+        $currentBranchId = (int)($editJob['branch_id'] ?? 0);
         $stmt = $pdo->prepare('SELECT category_id FROM job_categories WHERE job_id=:jid');
         $stmt->execute([':jid' => $editJobId]);
         $editJobCategoryIds = array_map(static fn($r) => (int)$r['category_id'], $stmt->fetchAll());
@@ -381,6 +412,10 @@ render_header('Trang nhà tuyển dụng');
                 </a>
                 <a href="<?= e(BASE_URL) ?>/employer/index.php?page=dashboard"
                    class="list-group-item list-group-item-action <?= $page === 'dashboard' ? 'active' : '' ?>">Tổng quan</a>
+                   <a href="<?= e(BASE_URL) ?>/employer/index.php?page=branches"
+   class="list-group-item list-group-item-action <?= $page === 'branches' ? 'active' : '' ?>">
+   Chi nhánh
+</a>
             </div>
         </div>
     </div>
@@ -416,6 +451,67 @@ render_header('Trang nhà tuyển dụng');
                         </div>
                     </div>
                 </div>
+
+                <!-- Biểu đồ số ứng viên theo từng job -->
+                <?php if (!empty($chartJobsData)): ?>
+                <div class="mt-4">
+                    <h6 class="mb-3"><i class="fa-solid fa-chart-bar me-2"></i>Số ứng viên theo việc làm (top <?= count($chartJobsData) ?>)</h6>
+                    <div style="position:relative; height:260px;">
+                        <canvas id="applicantChart"></canvas>
+                    </div>
+                </div>
+                <script>
+                    document.addEventListener('DOMContentLoaded', function() {
+                    const isDark = document.body.classList.contains('dark-mode');
+                    const gridColor = isDark ? 'rgba(255,255,255,.08)' : 'rgba(0,0,0,.06)';
+                    const textColor = isDark ? '#c8cfe0' : '#6b7280';
+
+                    const labels = <?= json_encode(array_map(fn($r) => mb_strimwidth((string)$r['title'], 0, 22, '…'), $chartJobsData)) ?>;
+                    const values = <?= json_encode(array_map(fn($r) => (int)$r['cnt'], $chartJobsData)) ?>;
+
+                    const ctx = document.getElementById('applicantChart');
+                    if (!ctx) return;
+                    new Chart(ctx, {
+                        type: 'bar',
+                        data: {
+                            labels,
+                            datasets: [{
+                                label: 'Số ứng viên',
+                                data: values,
+                                backgroundColor: 'rgba(16,185,129,.7)',
+                                borderColor: '#059669',
+                                borderWidth: 1,
+                                borderRadius: 6,
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {
+                                legend: { display: false },
+                                tooltip: {
+                                    callbacks: { label: ctx => ` ${ctx.raw} ứng viên` }
+                                }
+                            },
+                            scales: {
+                                x: {
+                                    ticks: { color: textColor, maxRotation: 30 },
+                                    grid:  { color: gridColor }
+                                },
+                                y: {
+                                    ticks: { color: textColor, stepSize: 1, precision: 0 },
+                                    grid:  { color: gridColor },
+                                    beginAtZero: true
+                                }
+                            }
+                        }
+                    });
+                })();
+                </script>
+                <?php else: ?>
+                <div class="mt-3 muted small">Chưa có dữ liệu ứng viên để hiển thị biểu đồ.</div>
+                <?php endif; ?>
+
                 <div class="mt-4">
                     <a href="<?= e(BASE_URL) ?>/employer/index.php?page=jobs&action=create_form" class="btn btn-success">
                         <i class="fa-solid fa-plus me-2"></i>Đăng việc làm mới
@@ -468,73 +564,239 @@ render_header('Trang nhà tuyển dụng');
             <?php $showCreate = ($_GET['action'] ?? '') === 'create_form'; ?>
 
             <?php if ($showCreate): ?>
-                <!-- Form tạo job mới -->
+                <!-- Form tạo job mới — WIZARD 3 BƯỚC -->
                 <div class="app-card p-4">
-                    <h4 class="mb-3"><i class="fa-solid fa-clipboard-plus me-2"></i>Đăng việc làm mới</h4>
-                    <form method="POST" enctype="multipart/form-data">
+                    <h4 class="mb-4"><i class="fa-solid fa-clipboard-plus me-2"></i>Đăng việc làm mới</h4>
+
+                    <!-- Progress bar -->
+                    <div class="mb-4">
+                        <div class="d-flex justify-content-between mb-1" id="stepLabels">
+                            <span class="small fw-bold step-label active" data-step="1">① Thông tin cơ bản</span>
+                            <span class="small fw-bold step-label" data-step="2">② Mô tả &amp; Yêu cầu</span>
+                            <span class="small fw-bold step-label" data-step="3">③ Hình ảnh &amp; Danh mục</span>
+                        </div>
+                        <div class="progress" style="height:6px;border-radius:6px;">
+                            <div id="wizardProgress" class="progress-bar bg-success"
+                                 style="width:33%;transition:width .3s;border-radius:6px;"></div>
+                        </div>
+                    </div>
+
+                    <form method="POST" enctype="multipart/form-data" id="wizardForm" novalidate>
                         <input type="hidden" name="csrf"   value="<?= e(csrf_token()) ?>">
                         <input type="hidden" name="action" value="create_job">
-                        <div class="row g-3">
-                            <div class="col-md-6">
-                                <label class="form-label">Tiêu đề việc làm *</label>
-                                <input class="form-control" name="title" required>
+
+                        <!-- BƯỚC 1: Thông tin cơ bản -->
+                        <div class="wizard-step" id="step1">
+                            <div class="row g-3">
+                                <div class="col-md-6">
+                                    <label class="form-label">Tiêu đề việc làm <span class="text-danger">*</span></label>
+                                    <input class="form-control" name="title" id="f_title" placeholder="VD: Lập trình viên PHP" required>
+                                </div>
+                                <div class="col-md-6">
+                                    <label class="form-label">Mức lương (hiển thị)</label>
+                                    <input class="form-control" name="salary" id="f_salary" placeholder="VD: 10-15 triệu">
+                                </div>
+                                <div class="col-md-4">
+                                    <label class="form-label">Lương tối thiểu (VNĐ)</label>
+                                    <input class="form-control" type="number" name="salary_min" id="f_salary_min" placeholder="10000000">
+                                </div>
+                                <div class="col-md-4">
+                                    <label class="form-label">Lương tối đa (VNĐ)</label>
+                                    <input class="form-control" type="number" name="salary_max" id="f_salary_max" placeholder="15000000">
+                                </div>
+                                <div class="col-md-4">
+                                    <label class="form-label">Địa điểm</label>
+                                    <input class="form-control" name="location" id="f_location" placeholder="Hà Nội, HCM...">
+                                </div>
+                                <div class="col-md-4">
+                                    <label class="form-label">Chi nhánh làm việc</label>
+                                    <select class="form-select" name="branch_id" id="f_branch_id">
+                                    <option value="">-- Chọn chi nhánh (không bắt buộc) --</option>
+                                    <?php foreach ($branches as $br): ?>
+            <option value="<?= (int)$br['id'] ?>">
+                <?= e(branch_location_label($br)) ?>
+                <?= $br['is_headquarter'] ? '(Trụ sở chính)' : '' ?>
+            </option>
+        <?php endforeach; ?>
+    </select>
+    <div class="muted small">Nếu không chọn, địa chỉ công ty sẽ được hiển thị.</div>
+</div>
                             </div>
-                            <div class="col-md-6">
-                                <label class="form-label">Mức lương (hiển thị)</label>
-                                <input class="form-control" name="salary" placeholder="VD: 10-15 triệu">
+                            <div class="d-flex justify-content-end mt-4">
+                                <button type="button" class="btn btn-success" onclick="wizardNext(1)">
+                                    Tiếp theo <i class="fa-solid fa-arrow-right ms-1"></i>
+                                </button>
                             </div>
-                            <div class="col-md-4">
-                                <label class="form-label">Lương tối thiểu (VNĐ)</label>
-                                <input class="form-control" type="number" name="salary_min" placeholder="10000000">
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label">Lương tối đa (VNĐ)</label>
-                                <input class="form-control" type="number" name="salary_max" placeholder="15000000">
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label">Địa điểm</label>
-                                <input class="form-control" name="location" placeholder="Hà Nội, HCM...">
-                            </div>
-                            <div class="col-md-12">
-                                <label class="form-label">Mô tả</label>
-                                <textarea class="form-control" name="description" rows="4"></textarea>
-                            </div>
-                            <div class="col-md-12">
-                                <label class="form-label">Yêu cầu</label>
-                                <textarea class="form-control" name="requirement" rows="3"></textarea>
-                            </div>
-                            <div class="col-md-12">
-                                <label class="form-label">Ảnh chính *</label>
-                                <input class="form-control" type="file" name="image" accept="image/*" required>
-                            </div>
-                            <div class="col-md-12">
-                                <label class="form-label">Ảnh phụ (nhiều ảnh)</label>
-                                <input class="form-control" type="file" name="job_images[]" accept="image/*" multiple>
-                            </div>
-                            <div class="col-md-12">
-                                <label class="form-label">Danh mục</label>
-                                <div class="row g-2">
-                                    <?php foreach ($categories as $cat): ?>
-                                        <div class="col-md-4">
-                                            <div class="soft-border rounded-14 p-3 bg-white">
-                                                <label class="d-flex gap-2 align-items-center">
-                                                    <input type="checkbox" name="categories[]" value="<?= (int)$cat['id'] ?>">
-                                                    <span class="fw-bold"><?= e((string)$cat['name']) ?></span>
-                                                </label>
-                                            </div>
-                                        </div>
-                                    <?php endforeach; ?>
+                        </div>
+
+                        <!-- BƯỚC 2: Mô tả & Yêu cầu -->
+                        <div class="wizard-step" id="step2" style="display:none;">
+                            <div class="row g-3">
+                                <div class="col-md-12">
+                                    <label class="form-label">Mô tả công việc</label>
+                                    <textarea class="form-control" name="description" id="f_desc" rows="5"
+                                              placeholder="Mô tả chi tiết về công việc, môi trường làm việc..."></textarea>
+                                </div>
+                                <div class="col-md-12">
+                                    <label class="form-label">Yêu cầu ứng viên</label>
+                                    <textarea class="form-control" name="requirement" id="f_req" rows="4"
+                                              placeholder="Kinh nghiệm, kỹ năng, bằng cấp yêu cầu..."></textarea>
                                 </div>
                             </div>
-                            <div class="col-md-12">
-                                <button class="btn btn-success">
-                                    <i class="fa-solid fa-plus me-2"></i>Tạo việc làm (chờ duyệt)
+                            <div class="d-flex justify-content-between mt-4">
+                                <button type="button" class="btn btn-outline-secondary" onclick="wizardBack(2)">
+                                    <i class="fa-solid fa-arrow-left me-1"></i> Quay lại
                                 </button>
-                                <a href="<?= e(BASE_URL) ?>/employer/index.php?page=jobs" class="btn btn-outline-secondary ms-2">Hủy</a>
+                                <button type="button" class="btn btn-success" onclick="wizardNext(2)">
+                                    Tiếp theo <i class="fa-solid fa-arrow-right ms-1"></i>
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- BƯỚC 3: Hình ảnh & Danh mục -->
+                        <div class="wizard-step" id="step3" style="display:none;">
+                            <div class="row g-3">
+                                <div class="col-md-12">
+                                    <label class="form-label">Ảnh chính <span class="text-danger">*</span></label>
+                                    <input class="form-control" type="file" name="image" id="f_image" accept="image/*" required>
+                                    <div id="imagePreview" class="mt-2"></div>
+                                </div>
+                                <div class="col-md-12">
+                                    <label class="form-label">Ảnh phụ (nhiều ảnh)</label>
+                                    <input class="form-control" type="file" name="job_images[]" accept="image/*" multiple>
+                                </div>
+                                <div class="col-md-12">
+                                    <label class="form-label">Danh mục</label>
+                                    <div class="row g-2">
+                                        <?php foreach ($categories as $cat): ?>
+                                            <div class="col-md-4">
+                                                <div class="soft-border rounded-14 p-3 bg-white">
+                                                    <label class="d-flex gap-2 align-items-center" style="cursor:pointer;">
+                                                        <input type="checkbox" name="categories[]" value="<?= (int)$cat['id'] ?>">
+                                                        <span class="fw-bold"><?= e((string)$cat['name']) ?></span>
+                                                    </label>
+                                                </div>
+                                            </div>
+                                        <?php endforeach; ?>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="d-flex justify-content-between mt-4">
+                                <button type="button" class="btn btn-outline-secondary" onclick="wizardBack(3)">
+                                    <i class="fa-solid fa-arrow-left me-1"></i> Quay lại
+                                </button>
+                                <button type="submit" class="btn btn-success">
+                                    <i class="fa-solid fa-check me-1"></i> Hoàn tất — Tạo việc làm
+                                </button>
                             </div>
                         </div>
                     </form>
+
+                    <div class="mt-3 text-center">
+                        <a href="<?= e(BASE_URL) ?>/employer/index.php?page=jobs" class="btn btn-link text-muted btn-sm">
+                            Hủy và quay lại danh sách
+                        </a>
+                    </div>
                 </div>
+
+                <style>
+                .step-label { color: var(--text-muted); }
+                .step-label.active { color: #059669; }
+                </style>
+
+                <script>
+(function() {
+    const STEPS = 3;
+    let current = 1;
+
+    function show(n) {
+        for (let i = 1; i <= STEPS; i++) {
+            const el = document.getElementById('step' + i);
+            if (el) el.style.display = (i === n) ? 'block' : 'none';
+        }
+        const progress = document.getElementById('wizardProgress');
+        if (progress) progress.style.width = (n / STEPS * 100) + '%';
+        // labels
+        document.querySelectorAll('.step-label').forEach(function(el) {
+            el.classList.toggle('active', parseInt(el.dataset.step, 10) === n);
+        });
+        current = n;
+    }
+
+    window.wizardNext = function(from) {
+        if (from === 1) {
+            const title = document.getElementById('f_title');
+            if (!title || title.value.trim() === '') {
+                if (title) title.classList.add('is-invalid');
+                if (title) title.focus();
+                return;
+            }
+            if (title) title.classList.remove('is-invalid');
+        }
+        if (from === 2) {
+            // không validate gì thêm
+        }
+        if (from === 3) {
+            const img = document.getElementById('f_image');
+            if (!img || img.files.length === 0) {
+                if (img) img.classList.add('is-invalid');
+                if (img) img.focus();
+                return;
+            }
+            if (img) img.classList.remove('is-invalid');
+        }
+        show(from + 1);
+    };
+
+    window.wizardBack = function(from) {
+        show(from - 1);
+    };
+
+    // Image preview
+    const imgInput = document.getElementById('f_image');
+    if (imgInput) {
+        imgInput.addEventListener('change', function() {
+            const preview = document.getElementById('imagePreview');
+            if (preview) {
+                preview.innerHTML = '';
+                if (this.files && this.files[0]) {
+                    const img = document.createElement('img');
+                    img.style.cssText = 'max-height:140px;border-radius:10px;border:1px solid var(--border);';
+                    img.src = URL.createObjectURL(this.files[0]);
+                    preview.appendChild(img);
+                }
+            }
+        });
+    }
+
+    // Validate on final submit
+    const wizardForm = document.getElementById('wizardForm');
+    if (wizardForm) {
+        wizardForm.addEventListener('submit', function(e) {
+            const title = document.getElementById('f_title');
+            const img = document.getElementById('f_image');
+            if (!title || title.value.trim() === '') {
+                e.preventDefault();
+                show(1);
+                if (title) title.classList.add('is-invalid');
+                if (title) title.focus();
+                return;
+            }
+            if (!img || img.files.length === 0) {
+                e.preventDefault();
+                show(3);
+                if (img) img.classList.add('is-invalid');
+                if (img) img.focus();
+                return;
+            }
+            // Nếu hợp lệ, form sẽ submit bình thường
+        });
+    }
+
+    // Hiển thị bước 1 ban đầu
+    show(1);
+})();
+</script>
 
             <?php else: ?>
                 <!-- Danh sách job -->
@@ -557,7 +819,7 @@ render_header('Trang nhà tuyển dụng');
                                         <div>
                                             <div class="fw-bold"><?= e((string)$j['title']) ?></div>
                                             <div class="muted small">
-                                                <i class="fa-solid fa-location-dot me-1"></i><?= e((string)$j['location']) ?>
+                                                <i class="fa-solid fa-location-dot me-1"></i><?= e((string)($j['location'] ?? '')) ?>
                                             </div>
                                         </div>
                                         <?php
@@ -666,33 +928,43 @@ render_header('Trang nhà tuyển dụng');
                         <div class="row g-3">
                             <div class="col-md-6">
                                 <label class="form-label">Tiêu đề việc làm *</label>
-                                <input class="form-control" name="title" value="<?= e((string)$editJob['title']) ?>" required>
+                                <input class="form-control" name="title" value="<?= e((string)($editJob['title'] ?? '')) ?>" required>
                             </div>
                             <div class="col-md-6">
                                 <label class="form-label">Mức lương (hiển thị)</label>
-                                <input class="form-control" name="salary" value="<?= e((string)$editJob['salary']) ?>">
+                                <input class="form-control" name="salary" value="<?= e((string)($editJob['salary'] ?? '')) ?>">
                             </div>
                             <div class="col-md-4">
                                 <label class="form-label">Lương tối thiểu (VNĐ)</label>
-                                <input class="form-control" type="number" name="salary_min"
-                                       value="<?= e((string)($editJob['salary_min'] ?? '')) ?>">
+                                <input class="form-control" type="number" name="salary_min" value="<?= e((string)($editJob['salary_min'] ?? '')) ?>">
                             </div>
                             <div class="col-md-4">
                                 <label class="form-label">Lương tối đa (VNĐ)</label>
-                                <input class="form-control" type="number" name="salary_max"
-                                       value="<?= e((string)($editJob['salary_max'] ?? '')) ?>">
+                                <input class="form-control" type="number" name="salary_max" value="<?= e((string)($editJob['salary_max'] ?? '')) ?>">
                             </div>
                             <div class="col-md-4">
                                 <label class="form-label">Địa điểm</label>
-                                <input class="form-control" name="location" value="<?= e((string)$editJob['location']) ?>">
+                                <input class="form-control" name="location" value="<?= e((string)($editJob['location'] ?? '')) ?>">
                             </div>
+                            <div class="col-md-4">
+    <label class="form-label">Chi nhánh làm việc</label>
+    <select class="form-select" name="branch_id">
+        <option value="">-- Chọn chi nhánh (không bắt buộc) --</option>
+        <?php foreach ($branches as $br): ?>
+            <option value="<?= (int)$br['id'] ?>" <?= $currentBranchId === (int)$br['id'] ? 'selected' : '' ?>>
+                <?= e(branch_location_label($br)) ?>
+                <?= $br['is_headquarter'] ? '(Trụ sở chính)' : '' ?>
+            </option>
+        <?php endforeach; ?>
+    </select>
+</div>
                             <div class="col-md-12">
                                 <label class="form-label">Mô tả</label>
-                                <textarea class="form-control" name="description" rows="4"><?= e((string)$editJob['description']) ?></textarea>
+                                <textarea class="form-control" name="description" rows="4"><?= e((string)($editJob['description'] ?? '')) ?></textarea>
                             </div>
                             <div class="col-md-12">
                                 <label class="form-label">Yêu cầu</label>
-                                <textarea class="form-control" name="requirement" rows="3"><?= e((string)$editJob['requirement']) ?></textarea>
+                                <textarea class="form-control" name="requirement" rows="3"><?= e((string)($editJob['requirement'] ?? '')) ?></textarea>
                             </div>
                             <div class="col-md-12">
                                 <label class="form-label">Thay ảnh chính (không bắt buộc)</label>

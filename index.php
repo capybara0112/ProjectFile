@@ -683,40 +683,42 @@ if ($page === 'job' && isset($_GET['id'])) {
 //  DANH SÁCH VIỆC LÀM  (?page=jobs)
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 if ($page === 'jobs') {
-    $params = [];
-    $where  = 'WHERE j.status = "approved"';
+    // ... bên trong if ($page === 'jobs')
+$params = [];
+$where = 'WHERE j.status = "approved"';
 
-    if ($keyword !== '') {
-        $where .= ' AND (j.title LIKE :kw OR j.description LIKE :kw OR j.requirement LIKE :kw OR COALESCE(NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""), NULLIF(cb.province, ""), NULLIF(c.address, "")) LIKE :kw)';
-        $params[':kw'] = '%' . $keyword . '%';
-    }
-    if ($location !== '') {
-        $where .= ' AND COALESCE(NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""), NULLIF(cb.province, ""), NULLIF(c.address, "")) LIKE :loc';
-        $params[':loc'] = '%' . $location . '%';
-    }
-    if ($categoryId > 0) {
-        $where .= ' AND EXISTS (SELECT 1 FROM job_categories jc WHERE jc.job_id=j.id AND jc.category_id=:cat)';
-        $params[':cat'] = $categoryId;
-    }
+if ($keyword !== '') {
+    $where .= ' AND (j.title LIKE :kw OR j.description LIKE :kw OR j.requirement LIKE :kw OR COALESCE(NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""), NULLIF(cb.province, ""), NULLIF(c.address, "")) LIKE :kw)';
+    $params[':kw'] = '%' . $keyword . '%';
+}
+if ($location !== '') {
+    $where .= ' AND COALESCE(NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""), NULLIF(cb.province, ""), NULLIF(c.address, "")) LIKE :loc';
+    $params[':loc'] = '%' . $location . '%';
+}
+if ($categoryId > 0) {
+    $where .= ' AND EXISTS (SELECT 1 FROM job_categories jc WHERE jc.job_id = j.id AND jc.category_id = :cat)';
+    $params[':cat'] = $categoryId;
+}
 
-    $countStmt = $pdo->prepare('SELECT COUNT(*) FROM jobs j JOIN companies c ON c.id = j.company_id LEFT JOIN company_branches cb ON cb.id = j.branch_id ' . $where);
-    $countStmt->execute($params);
-    $total      = (int)$countStmt->fetchColumn();
-    $totalPages = max(1, (int)ceil($total / $perPage));
-    $offset     = ($pageNum - 1) * $perPage;
+// Thay thế đoạn từ "COUNT(*)" đến hết phần xử lý phân trang
+$countStmt = $pdo->prepare('SELECT COUNT(*) FROM jobs j JOIN companies c ON c.id = j.company_id LEFT JOIN company_branches cb ON cb.id = j.branch_id ' . $where);
+$countStmt->execute($params);
+$total = (int)$countStmt->fetchColumn();
 
-    $sql = 'SELECT j.*, c.id AS company_id_val, c.name AS company_name, c.logo AS company_logo, c.address AS company_address,
-                   cb.province, cb.address_detail, cb.full_address,
-                   COALESCE(NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""), NULLIF(cb.province, ""), NULLIF(c.address, "")) AS location_label
-            FROM jobs j JOIN companies c ON c.id = j.company_id
-            LEFT JOIN company_branches cb ON cb.id = j.branch_id
-            ' . $where . ' ORDER BY j.id DESC LIMIT :lim OFFSET :off';
-    $stmt = $pdo->prepare($sql);
-    foreach ($params as $k => $v) $stmt->bindValue($k, $v);
-    $stmt->bindValue(':lim', $perPage, PDO::PARAM_INT);
-    $stmt->bindValue(':off', $offset,  PDO::PARAM_INT);
-    $stmt->execute();
-    $jobs = $stmt->fetchAll();
+$sql = 'SELECT j.*, c.id AS company_id_val, c.name AS company_name, c.logo AS company_logo, c.address AS company_address,
+               cb.province, cb.address_detail, cb.full_address,
+               COALESCE(NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""), NULLIF(cb.province, ""), NULLIF(c.address, "")) AS location_label
+        FROM jobs j JOIN companies c ON c.id = j.company_id
+        LEFT JOIN company_branches cb ON cb.id = j.branch_id
+        ' . $where . ' ORDER BY j.id DESC LIMIT :lim OFFSET :off';
+$stmt = $pdo->prepare($sql);
+foreach ($params as $key => $value) {
+    $stmt->bindValue($key, $value);
+}
+$stmt->bindValue(':lim', $perPage, PDO::PARAM_INT);
+$stmt->bindValue(':off', $offset, PDO::PARAM_INT);
+$stmt->execute();
+$jobs = $stmt->fetchAll();
 
     $categories = $pdo->query('SELECT id, name FROM categories ORDER BY name ASC')->fetchAll();
 

@@ -184,6 +184,15 @@ render_header('Trang quản trị');
     <div class="col-lg-9">
 
         <?php if ($page === 'dashboard'): ?>
+            <?php
+            // Đếm jobs theo trạng thái cho biểu đồ
+            $jobStats = $pdo->query("
+                SELECT status, COUNT(*) as cnt FROM jobs GROUP BY status
+            ")->fetchAll(PDO::FETCH_KEY_PAIR);
+            $statPending  = (int)($jobStats['pending']  ?? 0);
+            $statApproved = (int)($jobStats['approved'] ?? 0);
+            $statRejected = (int)($jobStats['rejected'] ?? 0);
+            ?>
             <!-- Tổng quan -->
             <div class="app-card p-4">
                 <h4 class="mb-3"><i class="fa-solid fa-gauge-high me-2"></i>Tổng quan</h4>
@@ -209,7 +218,75 @@ render_header('Trang quản trị');
                         </div>
                     </div>
                 </div>
+
+                <!-- Biểu đồ tỷ lệ việc làm theo trạng thái -->
+                <div class="row g-3 mt-2">
+                    <div class="col-md-5">
+                        <div class="app-card p-4 soft-border text-center">
+                            <h6 class="mb-3"><i class="fa-solid fa-chart-pie me-2"></i>Tỷ lệ việc làm theo trạng thái</h6>
+                            <canvas id="jobStatusChart" style="max-height:240px;"></canvas>
+                            <div class="mt-3 d-flex justify-content-center gap-3 small muted">
+                                <span><span style="color:#f59e0b">■</span> Chờ duyệt (<?= $statPending ?>)</span>
+                                <span><span style="color:#10b981">■</span> Đã duyệt (<?= $statApproved ?>)</span>
+                                <span><span style="color:#ef4444">■</span> Từ chối (<?= $statRejected ?>)</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-7">
+                        <div class="app-card p-4 soft-border h-100 d-flex flex-column justify-content-center">
+                            <h6 class="mb-3"><i class="fa-solid fa-info-circle me-2"></i>Tóm tắt hệ thống</h6>
+                            <ul class="list-unstyled mb-0">
+                                <li class="py-2 border-bottom" style="border-color:var(--border)!important">
+                                    <span class="muted small">Tổng việc làm</span>
+                                    <span class="float-end fw-bold"><?= $statPending + $statApproved + $statRejected ?></span>
+                                </li>
+                                <li class="py-2 border-bottom" style="border-color:var(--border)!important">
+                                    <span class="muted small">Người dùng</span>
+                                    <span class="float-end fw-bold"><?= count($users) ?></span>
+                                </li>
+                                <li class="py-2">
+                                    <span class="muted small">Danh mục</span>
+                                    <span class="float-end fw-bold"><?= count($categories) ?></span>
+                                </li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
             </div>
+
+            <script>
+                document.addEventListener('DOMContentLoaded', function() {
+    const isDark = document.body.classList.contains('dark-mode');
+    const gridColor = isDark ? 'rgba(255,255,255,.1)' : 'rgba(0,0,0,.05)';
+    const textColor = isDark ? '#c8cfe0' : '#6b7280';
+
+    const ctx = document.getElementById('jobStatusChart');
+    if (!ctx) return;
+    new Chart(ctx, {
+        type: 'pie',
+        data: {
+            labels: ['Chờ duyệt', 'Đã duyệt', 'Từ chối'],
+            datasets: [{
+                data: [<?= $statPending ?>, <?= $statApproved ?>, <?= $statRejected ?>],
+                backgroundColor: ['#f59e0b', '#10b981', '#ef4444'],
+                borderWidth: 2,
+                borderColor: isDark ? '#1a1d27' : '#fff'
+            }]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: ctx => ` ${ctx.label}: ${ctx.raw} việc làm`
+                    }
+                }
+            }
+        }
+    });
+});
+</script>
 
         <?php elseif ($page === 'jobs'): ?>
             <!-- Duyệt việc làm -->
