@@ -11,14 +11,13 @@ $user = current_user();
 $candidateId = (int)$user['id'];
 
 $page = $_GET['page'] ?? 'dashboard';
-$allowedPages = ['dashboard', 'profile', 'skills', 'certificates', 'cv', 'applications', 'notifications'];
+$allowedPages = ['dashboard', 'profile', 'skills', 'certificates', 'cv', 'applications', 'notifications', 'saved_jobs', 'chat', 'chatbot'];
 
 if (!in_array($page, $allowedPages)) {
     $page = 'dashboard';
 }
 
-// Xử lý các action POST chung (upload avatar, update profile, upload cv, save skills, add certificate, remove skill, add new skill)
-// Các action này sẽ được xử lý tại đây để không trùng lặp.
+// Xử lý các action POST chung
 try {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $action = $_POST['action'] ?? '';
@@ -155,6 +154,41 @@ try {
             }
             redirect('/candidate/index.php?page=skills');
         }
+
+        // ======================== CHỨC NĂNG LƯU / BỎ LƯU VIỆC LÀM ========================
+        if ($action === 'toggle_save_job') {
+            $jobId = (int)($_POST['job_id'] ?? 0);
+            if ($jobId <= 0) {
+                throw new RuntimeException('Mã việc làm không hợp lệ.');
+            }
+
+            // Kiểm tra job tồn tại và đã được duyệt
+            $chk = $pdo->prepare('SELECT id FROM jobs WHERE id = :jid AND status = "approved" LIMIT 1');
+            $chk->execute([':jid' => $jobId]);
+            if (!$chk->fetch()) {
+                throw new RuntimeException('Việc làm không tồn tại hoặc chưa được duyệt.');
+            }
+
+            // Thử xóa trước (nếu đã lưu thì xóa = bỏ lưu)
+            $del = $pdo->prepare('DELETE FROM saved_jobs WHERE user_id = :uid AND job_id = :jid');
+            $del->execute([':uid' => $candidateId, ':jid' => $jobId]);
+
+            if ($del->rowCount() === 0) {
+                // Chưa lưu → lưu mới
+                $pdo->prepare('INSERT IGNORE INTO saved_jobs (user_id, job_id) VALUES (:uid, :jid)')
+                    ->execute([':uid' => $candidateId, ':jid' => $jobId]);
+                flash('Đã lưu việc làm. Xem trong "Việc làm đã lưu".', 'success');
+            } else {
+                flash('Đã bỏ lưu việc làm.', 'info');
+            }
+
+            $redirect = $_POST['redirect'] ?? '/candidate/index.php?page=saved_jobs';
+// Nếu redirect bắt đầu bằng /dacn thì bỏ phần dacn đi (vì BASE_URL đã có)
+if (str_starts_with($redirect, '/dacn')) {
+    $redirect = substr($redirect, 5); // bỏ '/dacn'
+}
+redirect($redirect);
+        }
     }
 } catch (Throwable $e) {
     flash('Thao tác thất bại: ' . $e->getMessage(), 'danger');
@@ -176,6 +210,5 @@ $pageFile = __DIR__ . '/' . $page . '.php';
 if (file_exists($pageFile)) {
     include $pageFile;
 } else {
-    // fallback dashboard
     include __DIR__ . '/dashboard.php';
 }

@@ -32,7 +32,15 @@ if ($empRow) {
 // Lấy danh sách chi nhánh của công ty
 $branches = [];
 if ($companyId) {
-    $branchStmt = $pdo->prepare('SELECT id, branch_name, full_address, address_detail, province, is_headquarter FROM company_branches WHERE company_id = :cid ORDER BY is_headquarter DESC, id ASC');
+$branchStmt = $pdo->prepare('
+    SELECT cb.id, cb.branch_name, cb.full_address, cb.address_detail,
+            cb.province_id, cb.is_headquarter,
+            COALESCE(p.name, cb.legacy_province, \'\') AS province_display
+    FROM   company_branches cb
+    LEFT JOIN provinces p ON p.id = cb.province_id
+    WHERE  cb.company_id = :cid
+    ORDER BY cb.is_headquarter DESC, cb.id ASC
+');
     $branchStmt->execute([':cid' => $companyId]);
     $branches = $branchStmt->fetchAll();
 }
@@ -92,20 +100,26 @@ try {
             $pdo->beginTransaction();
             try {
                 $pdo->prepare('
-                    INSERT INTO jobs (company_id, branch_id, title, description, requirement, salary, location, image, status, salary_min, salary_max)
-                    VALUES (:company_id, :branch_id, :title, :description, :requirement, :salary, :location, :image, "pending", :salary_min, :salary_max)
-            ')->execute([
-                    ':company_id'  => $companyId,
-                    ':branch_id'   => $branchId,
-                    ':title'       => $title,
-                    ':description' => $description,
-                    ':requirement' => $requirement,
-                    ':salary'      => $salary,
-                    ':location'    => $location,
-                    ':image'       => $mainImagePath,
-                    ':salary_min'  => $salaryMin,
-                    ':salary_max'  => $salaryMax,
-                ]);
+    INSERT INTO jobs
+        (company_id, branch_id, title, description, requirement,
+         legacy_salary, legacy_location, image, status,
+         salary_min, salary_max)
+    VALUES
+        (:company_id, :branch_id, :title, :description, :requirement,
+         :legacy_salary, :legacy_location, :image, "pending",
+         :salary_min, :salary_max)
+')->execute([
+    ':company_id'      => $companyId,
+    ':branch_id'       => $branchId,
+    ':title'           => $title,
+    ':description'     => $description,
+    ':requirement'     => $requirement,
+    ':legacy_salary'   => $salary,      // lấy từ POST
+    ':legacy_location' => $location,
+    ':image'           => $mainImagePath,
+    ':salary_min'      => $salaryMin,
+    ':salary_max'      => $salaryMax,
+]);
                 $jobId = (int)$pdo->lastInsertId();
 
                 $ins = $pdo->prepare('INSERT INTO job_categories (job_id, category_id) VALUES (:job_id, :category_id)');
@@ -152,15 +166,15 @@ try {
             $isRepost    = ((int)($_POST['repost'] ?? 0)) === 1;
 
             $updateFields = [
-                'title'       => $title,
-                'description' => $description,
-                'requirement' => $requirement,
-                'salary'      => $salary,
-                'location'    => $location,
-                'salary_min'  => $salaryMin,
-                'salary_max'  => $salaryMax,
-                'branch_id'   => $branchId,
-            ];
+    'title'           => $title,
+    'description'     => $description,
+    'requirement'     => $requirement,
+    'legacy_salary'   => $salary,
+    'legacy_location' => $location,
+    'salary_min'      => $salaryMin,
+    'salary_max'      => $salaryMax,
+    'branch_id'       => $branchId,
+];
 
             // Nếu đăng lại: reset pending và xóa rejection_reason
             if ($isRepost) {
@@ -290,7 +304,21 @@ if ($companyId && !$company) {
 // -----------------------------------------------------------------------------
 $categories = $pdo->query('SELECT id, name FROM categories ORDER BY name ASC')->fetchAll();
 
-$jobsStmt = $pdo->prepare('SELECT * FROM jobs WHERE company_id=:cid ORDER BY id DESC');
+$jobsStmt = $pdo->prepare('
+    SELECT j.id, j.company_id, j.branch_id, j.title, j.description, j.requirement,
+           j.image, j.status, j.created_at, j.rejection_reason,
+           j.legacy_salary, j.legacy_location,
+           j.salary_min, j.salary_max, j.salary_type,
+           COALESCE(cb.full_address, cb.address_detail, p.name, cb.legacy_province) AS location_label,
+           cb.full_address   AS branch_full_address,
+           cb.address_detail AS branch_address,
+           p.name            AS branch_province
+    FROM   jobs j
+    LEFT JOIN company_branches cb ON cb.id = j.branch_id
+    LEFT JOIN provinces p         ON p.id  = cb.province_id
+    WHERE  j.company_id = :cid
+    ORDER BY j.id DESC
+');
 $jobsStmt->execute([':cid' => $companyId]);
 $jobs = $jobsStmt->fetchAll();
 
@@ -415,6 +443,13 @@ render_header('Trang nhà tuyển dụng');
                    <a href="<?= e(BASE_URL) ?>/employer/index.php?page=branches"
    class="list-group-item list-group-item-action <?= $page === 'branches' ? 'active' : '' ?>">
    Chi nhánh
+</a>
+<a href="<?= e(BASE_URL) ?>/employer/chat.php" class="list-group-item list-group-item-action">
+    <i class="fa-solid fa-comments me-2"></i>Tin nhắn
+</a>
+
+<a href="<?= e(BASE_URL) ?>/employer/chatbot.php" class="list-group-item list-group-item-action">
+    <i class="fa-solid fa-robot me-2"></i>HRBot
 </a>
             </div>
         </div>
@@ -819,7 +854,7 @@ render_header('Trang nhà tuyển dụng');
                                         <div>
                                             <div class="fw-bold"><?= e((string)$j['title']) ?></div>
                                             <div class="muted small">
-                                                <i class="fa-solid fa-location-dot me-1"></i><?= e((string)($j['location'] ?? '')) ?>
+                                                <i class="fa-solid fa-location-dot me-1"></i><?= e((string)(job_location_label($j) ?? '')) ?>
                                             </div>
                                         </div>
                                         <?php
@@ -932,7 +967,7 @@ render_header('Trang nhà tuyển dụng');
                             </div>
                             <div class="col-md-6">
                                 <label class="form-label">Mức lương (hiển thị)</label>
-                                <input class="form-control" name="salary" value="<?= e((string)($editJob['salary'] ?? '')) ?>">
+                                <input class="form-control" name="salary" value="<?= e((string)($editJob['legacy_salary'] ?? '')) ?>">
                             </div>
                             <div class="col-md-4">
                                 <label class="form-label">Lương tối thiểu (VNĐ)</label>
@@ -944,7 +979,7 @@ render_header('Trang nhà tuyển dụng');
                             </div>
                             <div class="col-md-4">
                                 <label class="form-label">Địa điểm</label>
-                                <input class="form-control" name="location" value="<?= e((string)($editJob['location'] ?? '')) ?>">
+                                <input class="form-control" name="location" value="<?= e((string)($editJob['legacy_location'] ?? '')) ?>">
                             </div>
                             <div class="col-md-4">
     <label class="form-label">Chi nhánh làm việc</label>
@@ -1087,6 +1122,17 @@ render_header('Trang nhà tuyển dụng');
                                                 <i class="fa-solid fa-file-pdf me-2"></i>Mở CV
                                             </a>
                                         <?php endif; ?>
+                                            <a href="<?= e(BASE_URL) ?>/employer/candidate_profile.php?id=<?= (int)$app['candidate_id'] ?>"
+       class="btn btn-sm btn-outline-primary" target="_blank">
+       Xem hồ sơ
+    </a>
+
+    <form method="post" action="<?= e(BASE_URL) ?>/employer/chat.php" class="d-inline">
+        <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
+        <input type="hidden" name="action" value="start_conversation">
+        <input type="hidden" name="application_id" value="<?= (int)$app['application_id'] ?>">
+        <button type="submit" class="btn btn-sm btn-outline-success">Nhắn tin</button>
+    </form>
                                     </div>
 
                                     <!-- Trạng thái hiện tại -->
@@ -1175,8 +1221,10 @@ render_header('Trang nhà tuyển dụng');
                     </div>
                 <?php endif; ?>
             </div>
-
-        <?php endif; ?>
+    <?php elseif ($page === 'branches'): ?>
+    <?php include __DIR__ . '/branches.php'; ?>                    
+    <?php endif; ?>
+        
     </div>
 </div>
 

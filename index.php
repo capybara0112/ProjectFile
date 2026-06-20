@@ -11,10 +11,39 @@ require_once __DIR__ . '/lib/upload.php';
 //   /?page=job&id=X   → chi tiết 1 việc làm + ứng tuyển
 //   /?page=company&id=X → trang hồ sơ công ty + danh sách job của công ty
 // -------------------------------------------------------------
-
+// Helper: gửi thông báo (nếu chưa có)
+if (!function_exists('notify_user')) {
+    function notify_user(PDO $pdo, int $userId, string $content): void {
+        $stmt = $pdo->prepare('INSERT INTO notifications (user_id, content) VALUES (?, ?)');
+        $stmt->execute([$userId, $content]);
+    }
+}
+// Helper: phân trang (nếu chưa có)
+if (!function_exists('pagination_meta')) {
+    function pagination_meta(int $total, int $perPage, int $currentPage): array {
+        $totalPages = max(1, (int) ceil($total / $perPage));
+        $page = max(1, min($currentPage, $totalPages));
+        return [
+            'total'        => $total,
+            'per_page'     => $perPage,
+            'total_pages'  => $totalPages,
+            'page'         => $page,
+            'offset'       => ($page - 1) * $perPage,
+        ];
+    }
+}
 $pdo = db();
 
+$savedJobIds = [];
+$user = current_user();
+if ($user && $user['role'] === 'candidate') {
+    $stmt = $pdo->prepare('SELECT job_id FROM saved_jobs WHERE user_id = ?');
+    $stmt->execute([$user['id']]);
+    $savedJobIds = array_column($stmt->fetchAll(), 'job_id');
+}
+// ?page= = route (home|jobs|job|company). ?p= = số trang phân trang (không trùng nhau).
 $page    = $_GET['page'] ?? 'home';
+
 $perPage = 8;
 $pageNum = max(1, (int)($_GET['p'] ?? 1));
 
@@ -42,7 +71,19 @@ if ($page === 'company' && isset($_GET['id'])) {
     }
 
     // chi nhánh công ty (báº£ng company_branches)
-    $branchStmt = $pdo->prepare('SELECT id, branch_name, province, address_detail, full_address, COALESCE(NULLIF(full_address, ""), NULLIF(address_detail, ""), NULLIF(province, ""), NULLIF(branch_name, "")) AS location_label FROM company_branches WHERE company_id = :cid ORDER BY is_headquarter DESC, id ASC');
+$branchStmt = $pdo->prepare('
+    SELECT cb.id, cb.branch_name, cb.address_detail, cb.full_address,
+           COALESCE(p.name, cb.legacy_province, \'\') AS province_display,
+           COALESCE(
+               NULLIF(cb.full_address, \'\'), NULLIF(cb.address_detail, \'\'),
+               NULLIF(p.name, \'\'), NULLIF(cb.legacy_province, \'\'),
+               NULLIF(cb.branch_name, \'\')
+           ) AS location_label
+    FROM   company_branches cb
+    LEFT JOIN provinces p ON p.id = cb.province_id
+    WHERE  cb.company_id = :cid
+    ORDER BY cb.is_headquarter DESC, cb.id ASC
+');
     $branchStmt->execute([':cid' => $companyId]);
     $branches = $branchStmt->fetchAll();
 
@@ -67,7 +108,13 @@ if ($page === 'company' && isset($_GET['id'])) {
         $coJobParams[':smax'] = $fSalaryMax;
     }
     if ($fLocation !== '') {
-        $coJobWhere .= ' AND COALESCE(NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""), NULLIF(cb.province, ""), NULLIF(c.address, "")) LIKE :cloc';
+$coJobWhere .= ' AND COALESCE(
+    NULLIF(cb.full_address, \'\'),
+    NULLIF(cb.address_detail, \'\'),
+    NULLIF(p.name, \'\'),
+    NULLIF(cb.legacy_province, \'\'),
+    NULLIF(c.address, \'\')
+) LIKE :cloc';
         $coJobParams[':cloc'] = '%' . $fLocation . '%';
     }
     if ($fCategory > 0) {
@@ -77,12 +124,13 @@ if ($page === 'company' && isset($_GET['id'])) {
 
     // Phân trang job công ty
     $coCountStmt = $pdo->prepare('
-        SELECT COUNT(*)
-        FROM jobs j
-        JOIN companies c ON c.id = j.company_id
-        LEFT JOIN company_branches cb ON cb.id = j.branch_id
-        ' . $coJobWhere . '
-    ');
+    SELECT COUNT(*)
+    FROM jobs j
+    JOIN companies c ON c.id = j.company_id
+    LEFT JOIN company_branches cb ON cb.id = j.branch_id
+    LEFT JOIN provinces p ON p.id = cb.province_id
+    ' . $coJobWhere . '
+');
     $coCountStmt->execute($coJobParams);
     $coTotal = (int)$coCountStmt->fetchColumn();
 
@@ -91,16 +139,22 @@ if ($page === 'company' && isset($_GET['id'])) {
     $coOffset     = ($coPage - 1) * $perPage;
 
     $coJobsStmt = $pdo->prepare('
-        SELECT j.*, c.name AS company_name, c.logo AS company_logo, c.address AS company_address,
-               cb.province, cb.address_detail, cb.full_address,
-               COALESCE(NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""), NULLIF(cb.province, ""), NULLIF(c.address, "")) AS location_label
-        FROM jobs j
-        JOIN companies c ON c.id = j.company_id
-        LEFT JOIN company_branches cb ON cb.id = j.branch_id
-        ' . $coJobWhere . '
-        ORDER BY j.id DESC
-        LIMIT :lim OFFSET :off
-    ');
+    SELECT j.*, c.name AS company_name, c.logo AS company_logo, c.address AS company_address,
+           cb.address_detail, cb.full_address,
+           COALESCE(p.name, cb.legacy_province, \'\') AS province_display,
+           COALESCE(
+               NULLIF(cb.full_address, \'\'), NULLIF(cb.address_detail, \'\'),
+               NULLIF(p.name, \'\'), NULLIF(cb.legacy_province, \'\'),
+               NULLIF(c.address, \'\')
+           ) AS location_label
+    FROM jobs j
+    JOIN companies c ON c.id = j.company_id
+    LEFT JOIN company_branches cb ON cb.id = j.branch_id
+    LEFT JOIN provinces p ON p.id = cb.province_id
+    ' . $coJobWhere . '
+    ORDER BY j.id DESC
+    LIMIT :lim OFFSET :off
+');
     foreach ($coJobParams as $k => $v) $coJobsStmt->bindValue($k, $v);
     $coJobsStmt->bindValue(':lim', $perPage, PDO::PARAM_INT);
     $coJobsStmt->bindValue(':off', $coOffset, PDO::PARAM_INT);
@@ -300,7 +354,7 @@ if ($page === 'company' && isset($_GET['id'])) {
                                              class="soft-border rounded-14 bg-white p-1" alt="Logo">
                                     </a>
                                     <div class="flex-grow-1">
-                                        <div class="fw-bold"><?= e((string)$job['title']) ?></div>
+                                        <div class="job-card-title"><?= e((string)$job['title']) ?></div>
                                         <div class="muted small">
                                             <i class="fa-solid fa-location-dot me-1"></i><?= e(job_location_label($job)) ?>
                                         </div>
@@ -431,18 +485,21 @@ if ($page === 'job' && isset($_GET['id'])) {
         $pdo->prepare('INSERT INTO applications (job_id, candidate_id, cv_id, status) VALUES (:jid, :cid, :cvid, "pending")')
             ->execute([':jid' => $jobId, ':cid' => $candidateId, ':cvid' => $cvId]);
 
-        // Thông báo cho employer
-        $emStmt = $pdo->prepare('SELECT user_id FROM employers WHERE company_id=:cid LIMIT 1');
+        // Thông báo cho employer & candidate
+        $emStmt = $pdo->prepare('SELECT user_id FROM employers WHERE company_id = :cid LIMIT 1');
         $emStmt->execute([':cid' => (int)$job['company_id']]);
         $em = $emStmt->fetch();
         if ($em) {
-            $pdo->prepare('INSERT INTO notifications (user_id, content) VALUES (:uid, :content)')
-                ->execute([':uid' => (int)$em['user_id'],
-                           ':content' => sprintf('Ứng viên %s đã ứng tuyển vào vị trí của bạn.', (string)($user['name'] ?? ''))]);
+            notify_user(
+                $pdo,
+                (int)$em['user_id'],
+                sprintf(
+                    'Ứng viên %s đã ứng tuyển vào vị trí của bạn.',
+                    (string)($user['name'] ?? 'Ứng viên')
+                )
+            );
         }
-        // Thông báo cho candidate
-        $pdo->prepare('INSERT INTO notifications (user_id, content) VALUES (:uid, :content)')
-            ->execute([':uid' => $candidateId, ':content' => 'Bạn đã ứng tuyển thành công!']);
+        notify_user($pdo, $candidateId, 'Bạn đã ứng tuyển thành công!');
 
         flash('Ứng tuyển thành công. Vui lòng kiểm tra trang quản lý.', 'success');
         redirect('/candidate/index.php');
@@ -450,18 +507,26 @@ if ($page === 'job' && isset($_GET['id'])) {
 
     // Tải dữ liệu job
     $stmt = $pdo->prepare('
-        SELECT j.*, c.id AS company_id_val, c.name AS company_name,
-               c.description AS company_description,
-               c.address AS company_address, c.logo AS company_logo,
-               cb.province, cb.address_detail, cb.full_address,
-               COALESCE(NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""), NULLIF(cb.province, ""), NULLIF(c.address, "")) AS location_label
-        FROM jobs j
-        JOIN companies c ON c.id = j.company_id
-        LEFT JOIN company_branches cb ON cb.id = j.branch_id
-        WHERE j.id = :jid AND j.status = "approved"
-    ');
-    $stmt->execute([':jid' => $jobId]);
-    $job = $stmt->fetch();
+    SELECT j.id, j.company_id, j.branch_id, j.title, j.description, j.requirement,
+           j.image, j.status, j.created_at, j.salary_min, j.salary_max, j.salary_type,
+           c.id AS company_id_val, c.name AS company_name,
+           c.description AS company_description,
+           c.address AS company_address, c.logo AS company_logo,
+           cb.address_detail, cb.full_address,
+           COALESCE(p.name, cb.legacy_province, \'\') AS province_display,
+           COALESCE(
+               NULLIF(cb.full_address, \'\'), NULLIF(cb.address_detail, \'\'),
+               NULLIF(p.name, \'\'), NULLIF(cb.legacy_province, \'\'),
+               NULLIF(c.address, \'\')
+           ) AS location_label
+    FROM   jobs j
+    JOIN   companies c         ON c.id  = j.company_id
+    LEFT JOIN company_branches cb ON cb.id = j.branch_id
+    LEFT JOIN provinces p         ON p.id  = cb.province_id
+    WHERE  j.id = :jid AND j.status = "approved"
+');
+$stmt->execute([':jid' => $jobId]);
+$job = $stmt->fetch(PDO::FETCH_ASSOC);
 
     if (!$job) {
         render_header('Không tìm thấy việc làm');
@@ -555,6 +620,18 @@ if ($page === 'job' && isset($_GET['id'])) {
                             data-job-id="<?= (int)$jobId ?>" title="Yêu thích">
                         <i class="fa-regular fa-heart"></i>
                     </button>
+                    <?php if ($user && $user['role'] === 'candidate'): ?>
+    <?php $isSaved = in_array((int)$jobId, $savedJobIds); ?>
+    <form method="POST" action="<?= e(BASE_URL) ?>/candidate/index.php?page=saved_jobs" style="display:inline-block;">
+        <input type="hidden" name="csrf" value="<?= csrf_token() ?>">
+        <input type="hidden" name="action" value="toggle_save_job">
+        <input type="hidden" name="job_id" value="<?= (int)$jobId ?>">
+        <input type="hidden" name="redirect" value="<?= e(BASE_URL) ?>/?page=job&id=<?= (int)$jobId ?>">
+        <button type="submit" class="btn btn-sm <?= $isSaved ? 'btn-warning' : 'btn-outline-secondary' ?>" title="<?= $isSaved ? 'Bỏ lưu' : 'Lưu' ?>">
+            <i class="fa-<?= $isSaved ? 'solid' : 'regular' ?> fa-bookmark"></i>
+        </button>
+    </form>
+<?php endif; ?>
                 </div>
 
                 <!-- Danh mục -->
@@ -683,42 +760,76 @@ if ($page === 'job' && isset($_GET['id'])) {
 //  DANH SÁCH VIỆC LÀM  (?page=jobs)
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 if ($page === 'jobs') {
-    // ... bên trong if ($page === 'jobs')
-$params = [];
-$where = 'WHERE j.status = "approved"';
+    $params = [];
+    $where  = 'WHERE j.status = "approved"';
 
-if ($keyword !== '') {
-    $where .= ' AND (j.title LIKE :kw OR j.description LIKE :kw OR j.requirement LIKE :kw OR COALESCE(NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""), NULLIF(cb.province, ""), NULLIF(c.address, "")) LIKE :kw)';
-    $params[':kw'] = '%' . $keyword . '%';
-}
-if ($location !== '') {
-    $where .= ' AND COALESCE(NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""), NULLIF(cb.province, ""), NULLIF(c.address, "")) LIKE :loc';
-    $params[':loc'] = '%' . $location . '%';
-}
-if ($categoryId > 0) {
-    $where .= ' AND EXISTS (SELECT 1 FROM job_categories jc WHERE jc.job_id = j.id AND jc.category_id = :cat)';
-    $params[':cat'] = $categoryId;
-}
+    if ($keyword !== '') {
+$where .= ' AND (
+    j.title       LIKE :kw
+    OR j.description LIKE :kw
+    OR j.requirement LIKE :kw
+    OR COALESCE(
+        NULLIF(cb.full_address, \'\'), NULLIF(cb.address_detail, \'\'),
+        NULLIF(p.name, \'\'), NULLIF(cb.legacy_province, \'\'),
+        NULLIF(c.address, \'\')
+    ) LIKE :kw
+)';
+        $params[':kw'] = '%' . $keyword . '%';
+    }
+    if ($location !== '') {
+$where .= ' AND COALESCE(
+    NULLIF(cb.full_address, \'\'), NULLIF(cb.address_detail, \'\'),
+    NULLIF(p.name, \'\'), NULLIF(cb.legacy_province, \'\'),
+    NULLIF(c.address, \'\')
+) LIKE :loc';
+        $params[':loc'] = '%' . $location . '%';
+    }
+    if ($categoryId > 0) {
+        $where .= ' AND EXISTS (SELECT 1 FROM job_categories jc WHERE jc.job_id = j.id AND jc.category_id = :cat)';
+        $params[':cat'] = $categoryId;
+    }
 
-// Thay thế đoạn từ "COUNT(*)" đến hết phần xử lý phân trang
-$countStmt = $pdo->prepare('SELECT COUNT(*) FROM jobs j JOIN companies c ON c.id = j.company_id LEFT JOIN company_branches cb ON cb.id = j.branch_id ' . $where);
-$countStmt->execute($params);
-$total = (int)$countStmt->fetchColumn();
+    $countStmt = $pdo->prepare(
+        'SELECT COUNT(*) FROM jobs j
+         JOIN companies c ON c.id = j.company_id
+         LEFT JOIN company_branches cb ON cb.id = j.branch_id ' . $where
+    );
+    $countStmt->execute($params);
+    $total = (int)$countStmt->fetchColumn();
 
-$sql = 'SELECT j.*, c.id AS company_id_val, c.name AS company_name, c.logo AS company_logo, c.address AS company_address,
-               cb.province, cb.address_detail, cb.full_address,
-               COALESCE(NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""), NULLIF(cb.province, ""), NULLIF(c.address, "")) AS location_label
-        FROM jobs j JOIN companies c ON c.id = j.company_id
-        LEFT JOIN company_branches cb ON cb.id = j.branch_id
-        ' . $where . ' ORDER BY j.id DESC LIMIT :lim OFFSET :off';
-$stmt = $pdo->prepare($sql);
-foreach ($params as $key => $value) {
-    $stmt->bindValue($key, $value);
-}
-$stmt->bindValue(':lim', $perPage, PDO::PARAM_INT);
-$stmt->bindValue(':off', $offset, PDO::PARAM_INT);
-$stmt->execute();
-$jobs = $stmt->fetchAll();
+    $pagination = pagination_meta($total, $perPage, $pageNum);
+    $pageNum    = $pagination['page'];
+    $totalPages = $pagination['total_pages'];
+    $offset     = $pagination['offset'];
+
+    $sql = '
+    SELECT j.id, j.company_id, j.branch_id, j.title, j.description, j.image,
+           j.status, j.created_at, j.salary_min, j.salary_max, j.salary_type,
+           c.id AS company_id_val, c.name AS company_name,
+           c.logo AS company_logo, c.address AS company_address,
+           cb.address_detail, cb.full_address,
+           COALESCE(p.name, cb.legacy_province, \'\') AS province_display,
+           COALESCE(
+               NULLIF(cb.full_address, \'\'), NULLIF(cb.address_detail, \'\'),
+               NULLIF(p.name, \'\'), NULLIF(cb.legacy_province, \'\'),
+               NULLIF(c.address, \'\')
+           ) AS location_label
+    FROM   jobs j
+    JOIN   companies c         ON c.id  = j.company_id
+    LEFT JOIN company_branches cb ON cb.id = j.branch_id
+    LEFT JOIN provinces p         ON p.id  = cb.province_id
+    ' . $where . '
+    ORDER BY j.id DESC
+    LIMIT :lim OFFSET :off
+';
+    $stmt = $pdo->prepare($sql);
+    foreach ($params as $key => $value) {
+        $stmt->bindValue($key, $value);
+    }
+    $stmt->bindValue(':lim', $perPage, PDO::PARAM_INT);
+    $stmt->bindValue(':off', $offset, PDO::PARAM_INT);
+    $stmt->execute();
+    $jobs = $stmt->fetchAll();
 
     $categories = $pdo->query('SELECT id, name FROM categories ORDER BY name ASC')->fetchAll();
 
@@ -779,7 +890,7 @@ $jobs = $stmt->fetchAll();
                                          class="soft-border rounded-14 bg-white p-2" alt="Logo">
                                 </a>
                                 <div class="flex-grow-1">
-                                    <div class="fw-bold"><?= e((string)$job['title']) ?></div>
+                                    <div class="job-card-title"><?= e((string)$job['title']) ?></div>
                                     <!-- Tên công ty là link -->
                                     <a href="<?= e(BASE_URL) ?>/?page=company&id=<?= (int)($job['company_id_val'] ?? $job['company_id'] ?? 0) ?>"
                                        class="muted small" style="text-decoration:none">
@@ -807,6 +918,19 @@ $jobs = $stmt->fetchAll();
                                 </div>
                                 <a class="btn btn-success btn-sm"
                                    href="<?= e(BASE_URL) ?>/?page=job&id=<?= (int)$job['id'] ?>">Xem</a>
+                                   <?php if ($user && $user['role'] === 'candidate'): ?>
+    <?php $isSaved = in_array((int)$job['id'], $savedJobIds); ?>
+    <form method="POST" action="<?= e(BASE_URL) ?>/candidate/index.php?page=saved_jobs" style="display:inline-block; margin-left: 8px;">
+        <input type="hidden" name="csrf" value="<?= csrf_token() ?>">
+        <input type="hidden" name="action" value="toggle_save_job">
+        <input type="hidden" name="job_id" value="<?= (int)$job['id'] ?>">
+        <input type="hidden" name="redirect" value="<?= e(BASE_URL) ?>/?page=jobs">
+        <button type="submit" class="btn btn-sm <?= $isSaved ? 'btn-warning' : 'btn-outline-secondary' ?>" title="<?= $isSaved ? 'Bỏ lưu việc làm' : 'Lưu việc làm' ?>">
+            <i class="fa-<?= $isSaved ? 'solid' : 'regular' ?> fa-bookmark me-1"></i>
+            <?= $isSaved ? 'Đã lưu' : 'Lưu' ?>
+        </button>
+    </form>
+<?php endif; ?>
                             </div>
                         </div>
                     </div>
@@ -875,38 +999,49 @@ $jobs = $stmt->fetchAll();
 //  TRANG CHỦ
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 $categories = $pdo->query('SELECT id, name FROM categories ORDER BY name ASC')->fetchAll();
-$jobs       = $pdo->query('
-    SELECT j.*, c.id AS company_id_val, c.name AS company_name, c.logo AS company_logo, c.address AS company_address,
-           cb.province, cb.address_detail, cb.full_address,
-           COALESCE(NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""), NULLIF(cb.province, ""), NULLIF(c.address, "")) AS location_label
-    FROM jobs j JOIN companies c ON c.id = j.company_id
+$jobs = $pdo->query('
+    SELECT j.id, j.company_id, j.branch_id, j.title, j.image,
+           j.status, j.created_at, j.salary_min, j.salary_max, j.salary_type,
+           c.id AS company_id_val, c.name AS company_name,
+           c.logo AS company_logo, c.address AS company_address,
+           cb.address_detail, cb.full_address,
+           COALESCE(p.name, cb.legacy_province, \'\') AS province_display,
+           COALESCE(
+               NULLIF(cb.full_address, \'\'), NULLIF(cb.address_detail, \'\'),
+               NULLIF(p.name, \'\'), NULLIF(cb.legacy_province, \'\'),
+               NULLIF(c.address, \'\')
+           ) AS location_label
+    FROM   jobs j
+    JOIN   companies c         ON c.id  = j.company_id
     LEFT JOIN company_branches cb ON cb.id = j.branch_id
-    WHERE j.status = "approved"
-    ORDER BY j.id DESC LIMIT 6
-')->fetchAll();
+    LEFT JOIN provinces p         ON p.id  = cb.province_id
+    WHERE  j.status = "approved"
+    ORDER BY j.id DESC
+    LIMIT 6
+')->fetchAll(PDO::FETCH_ASSOC);
 
-render_header(SITE_NAME);
+render_header('Trang chủ');
 ?>
 
 <div class="row g-4">
-    <div class="col-lg-7">
-        <div class="app-card p-4">
-            <div class="d-flex align-items-center gap-3">
-                <div style="width:54px;height:54px;background:rgba(16,185,129,.16);display:flex;align-items:center;justify-content:center;border-radius:16px;">
-                    <i class="fa-solid fa-rocket" style="color:#059669;"></i>
+    <div class="col-lg-8">
+        <section class="hero-section mb-4">
+            <div class="hero-inner">
+            <div class="d-flex align-items-start gap-3 mb-3">
+                <div class="hero-icon-wrap flex-shrink-0">
+                    <i class="fa-solid fa-rocket"></i>
                 </div>
                 <div>
-                    <h3 class="mb-1">Tìm việc nhanh hơn mỗi ngày</h3>
-                    <div class="muted">Nền tảng tuyển dụng đơn giản bằng PHP + MySQL.</div>
+                    <h2 class="mb-1">Tìm việc nhanh hơn mỗi ngày</h2>
+                    <p class="hero-lead mb-0">Nền tảng tuyển dụng hiện đại — kết nối ứng viên và nhà tuyển dụng.</p>
                 </div>
             </div>
-            <div class="mt-4">
-                <form class="row g-2" method="GET" action="<?= e(BASE_URL) ?>/">
+            <form class="row g-2" method="GET" action="<?= e(BASE_URL) ?>/">
                     <input type="hidden" name="page" value="jobs">
-                    <div class="col-md-6">
-                        <input class="form-control" name="keyword" placeholder="Tìm theo vị trí/kỹ năng...">
+                    <div class="col-md-5">
+                        <input class="form-control" name="keyword" placeholder="Vị trí, kỹ năng, công ty...">
                     </div>
-                    <div class="col-md-4">
+                    <div class="col-md-5">
                         <select class="form-select" name="category">
                             <option value="0">Tất cả danh mục</option>
                             <?php foreach ($categories as $cat): ?>
@@ -915,18 +1050,18 @@ render_header(SITE_NAME);
                         </select>
                     </div>
                     <div class="col-md-2">
-                        <button class="btn btn-success w-100"><i class="fa-solid fa-magnifying-glass"></i> Tìm</button>
+                        <button type="submit" class="btn btn-hero-search w-100"><i class="fa-solid fa-magnifying-glass me-1"></i>Tìm</button>
                     </div>
                 </form>
             </div>
-        </div>
+        </section>
 
-        <div class="app-card p-4 mt-4">
-            <h4 class="mb-3"><i class="fa-solid fa-list me-2"></i>Việc làm nổi bật</h4>
+        <div class="app-card p-4">
+            <h3 class="section-title"><i class="fa-solid fa-briefcase"></i>Việc làm nổi bật</h3>
             <div class="row g-3">
                 <?php foreach ($jobs as $job): ?>
                     <div class="col-md-6">
-                        <div class="app-card p-3 soft-border h-100">
+                        <article class="job-card">
                             <div class="d-flex gap-3 align-items-start">
                                 <!-- Logo = link tới trang công ty -->
                                 <a href="<?= e(BASE_URL) ?>/?page=company&id=<?= (int)($job['company_id_val'] ?? 0) ?>">
@@ -935,7 +1070,7 @@ render_header(SITE_NAME);
                                          class="soft-border rounded-14 bg-white p-1" alt="Logo">
                                 </a>
                                 <div class="flex-grow-1">
-                                    <div class="fw-bold"><?= e((string)$job['title']) ?></div>
+                                    <div class="job-card-title"><?= e((string)$job['title']) ?></div>
                                     <!-- Tên công ty = link -->
                                     <a href="<?= e(BASE_URL) ?>/?page=company&id=<?= (int)($job['company_id_val'] ?? 0) ?>"
                                        class="muted small" style="text-decoration:none">
@@ -944,28 +1079,41 @@ render_header(SITE_NAME);
                                 </div>
                                 <a class="btn btn-outline-success btn-sm"
                                    href="<?= e(BASE_URL) ?>/?page=job&id=<?= (int)$job['id'] ?>">Xem</a>
+                                   <?php if ($user && $user['role'] === 'candidate'): ?>
+    <?php $isSaved = in_array((int)$job['id'], $savedJobIds); ?>
+    <form method="POST" action="<?= e(BASE_URL) ?>/candidate/index.php?page=saved_jobs" style="display:inline-block; margin-left: 8px;">
+        <input type="hidden" name="csrf" value="<?= csrf_token() ?>">
+        <input type="hidden" name="action" value="toggle_save_job">
+        <input type="hidden" name="job_id" value="<?= (int)$job['id'] ?>">
+        <input type="hidden" name="redirect" value="<?= e(BASE_URL) ?>/?page=jobs">
+        <button type="submit" class="btn btn-sm <?= $isSaved ? 'btn-warning' : 'btn-outline-secondary' ?>" title="<?= $isSaved ? 'Bỏ lưu việc làm' : 'Lưu việc làm' ?>">
+            <i class="fa-<?= $isSaved ? 'solid' : 'regular' ?> fa-bookmark me-1"></i>
+            <?= $isSaved ? 'Đã lưu' : 'Lưu' ?>
+        </button>
+    </form>
+<?php endif; ?>
                             </div>
                             <div class="mt-2 muted small">
                                 <i class="fa-solid fa-location-dot me-1"></i><?= e(job_location_label($job)) ?>
                                 <span class="mx-2">|</span>
                                 <i class="fa-solid fa-money-bill-wave me-1"></i><?= e(job_salary_label($job)) ?>
                             </div>
-                        </div>
+                        </article>
                     </div>
                 <?php endforeach; ?>
             </div>
-            <a href="<?= e(BASE_URL) ?>/?page=jobs" class="btn btn-success mt-3">
-                <i class="fa-solid fa-bolt me-1"></i>Xem tất cả việc làm
+            <a href="<?= e(BASE_URL) ?>/?page=jobs" class="btn btn-success mt-4">
+                <i class="fa-solid fa-arrow-right me-1"></i>Xem tất cả việc làm
             </a>
         </div>
     </div>
 
-    <div class="col-lg-5">
+    <div class="col-lg-4">
         <div class="app-card p-4">
-            <h4 class="mb-3"><i class="fa-solid fa-tags me-2"></i>Danh mục</h4>
+            <h3 class="section-title"><i class="fa-solid fa-tags"></i>Danh mục</h3>
             <div class="d-flex flex-wrap gap-2">
                 <?php foreach ($categories as $cat): ?>
-                    <a class="btn btn-outline-success btn-sm rounded-14"
+                    <a class="category-pill"
                        href="<?= e(BASE_URL) ?>/?page=jobs&category=<?= (int)$cat['id'] ?>">
                         <?= e((string)$cat['name']) ?>
                     </a>
@@ -974,7 +1122,7 @@ render_header(SITE_NAME);
         </div>
 
         <div class="app-card p-4 mt-4">
-            <h4 class="mb-3"><i class="fa-solid fa-user-tie me-2"></i>Truy cập nhanh</h4>
+            <h3 class="section-title"><i class="fa-solid fa-user-tie"></i>Truy cập nhanh</h3>
             <?php $user = current_user(); ?>
             <?php if (!$user): ?>
                 <a href="<?= e(BASE_URL) ?>/login.php"    class="btn btn-success w-100 mb-2"><i class="fa-solid fa-right-to-bracket me-1"></i>Đăng nhập</a>
@@ -994,4 +1142,3 @@ render_header(SITE_NAME);
 </div>
 
 <?php render_footer(); ?>
-

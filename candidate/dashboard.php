@@ -11,7 +11,8 @@ foreach ($appStmt->fetchAll() as $row) {
     $appStats['total'] += (int)$row['cnt'];
     if (isset($appStats[$st])) $appStats[$st] = (int)$row['cnt'];
 }
-// Lịch phỏng vấn sắp tới
+
+// Lịch phỏng vấn sắp tới (không thay đổi, không liên quan đến province)
 $upcomingInterviews = [];
 $ivStmt = $pdo->prepare('
     SELECT i.interview_date, i.location AS iv_location, i.note,
@@ -27,7 +28,7 @@ $ivStmt = $pdo->prepare('
 $ivStmt->execute([':cid' => $candidateId]);
 $upcomingInterviews = $ivStmt->fetchAll();
 
-// Gợi ý việc làm dựa trên danh mục đã ứng tuyển
+// Gợi ý việc làm dựa trên danh mục đã ứng tuyển (đã sửa cb.province)
 $suggestedJobs = [];
 $prevCatStmt = $pdo->prepare('
     SELECT DISTINCT jc.category_id
@@ -38,16 +39,25 @@ $prevCatStmt = $pdo->prepare('
 ');
 $prevCatStmt->execute([':cid' => $candidateId]);
 $prevCatIds = array_column($prevCatStmt->fetchAll(), 'category_id');
+
 if (!empty($prevCatIds)) {
     $inList = implode(',', array_map('intval', $prevCatIds));
     $sugStmt = $pdo->prepare("
-        SELECT DISTINCT j.*, c.id AS company_id_val, c.name AS company_name,
+        SELECT DISTINCT j.id, j.company_id, j.branch_id, j.title, j.description, j.requirement,
+               j.image, j.status, j.created_at, j.salary_min, j.salary_max, j.salary_type,
+               c.id AS company_id_val, c.name AS company_name,
                c.logo AS company_logo, c.address AS company_address,
-               cb.province, cb.address_detail, cb.full_address,
-               COALESCE(NULLIF(cb.full_address,''), NULLIF(cb.address_detail,''), NULLIF(cb.province,''), NULLIF(c.address,'')) AS location_label
+               cb.address_detail, cb.full_address,
+               COALESCE(p.name, cb.legacy_province, '') AS province_display,
+               COALESCE(
+                   NULLIF(cb.full_address, ''), NULLIF(cb.address_detail, ''),
+                   NULLIF(p.name, ''), NULLIF(cb.legacy_province, ''),
+                   NULLIF(c.address, '')
+               ) AS location_label
         FROM jobs j
         JOIN companies c ON c.id = j.company_id
         LEFT JOIN company_branches cb ON cb.id = j.branch_id
+        LEFT JOIN provinces p ON p.id = cb.province_id
         JOIN job_categories jc ON jc.job_id = j.id
         WHERE j.status = 'approved'
           AND jc.category_id IN ($inList)
@@ -58,17 +68,28 @@ if (!empty($prevCatIds)) {
     $sugStmt->execute([':cid' => $candidateId]);
     $suggestedJobs = $sugStmt->fetchAll();
 }
-// fallback nếu không có gợi ý
+
+// fallback nếu không có gợi ý (cũng sửa cb.province)
 if (empty($suggestedJobs)) {
     $suggestedJobs = $pdo->query('
-        SELECT j.*, c.id AS company_id_val, c.name AS company_name, c.logo AS company_logo, c.address AS company_address,
-               cb.province, cb.address_detail, cb.full_address,
-               COALESCE(NULLIF(cb.full_address,""), NULLIF(cb.address_detail,""), NULLIF(cb.province,""), NULLIF(c.address,"")) AS location_label
+        SELECT j.id, j.company_id, j.branch_id, j.title, j.description, j.requirement,
+               j.image, j.status, j.created_at, j.salary_min, j.salary_max, j.salary_type,
+               c.id AS company_id_val, c.name AS company_name,
+               c.logo AS company_logo, c.address AS company_address,
+               cb.address_detail, cb.full_address,
+               COALESCE(p.name, cb.legacy_province, \'\') AS province_display,
+               COALESCE(
+                   NULLIF(cb.full_address, \'\'), NULLIF(cb.address_detail, \'\'),
+                   NULLIF(p.name, \'\'), NULLIF(cb.legacy_province, \'\'),
+                   NULLIF(c.address, \'\')
+               ) AS location_label
         FROM jobs j
         JOIN companies c ON c.id = j.company_id
         LEFT JOIN company_branches cb ON cb.id = j.branch_id
+        LEFT JOIN provinces p ON p.id = cb.province_id
         WHERE j.status = "approved"
-        ORDER BY j.id DESC LIMIT 6
+        ORDER BY j.id DESC
+        LIMIT 6
     ')->fetchAll();
 }
 
@@ -77,7 +98,7 @@ render_header('Trang ứng viên');
 
 <div class="row g-4">
     <div class="col-lg-3">
-        <!-- Sidebar (giống như cũ) -->
+        <!-- Sidebar (giữ nguyên) -->
         <div class="app-card p-3">
             <div class="d-flex align-items-center gap-3 p-3 soft-border rounded-14 bg-white">
                 <?php if (!empty($profile['avatar'])): ?>
@@ -100,6 +121,8 @@ render_header('Trang ứng viên');
                 <a href="<?= e(BASE_URL) ?>/candidate/index.php?page=cv" class="list-group-item list-group-item-action <?= $page === 'cv' ? 'active' : '' ?>">CV</a>
                 <a href="<?= e(BASE_URL) ?>/candidate/index.php?page=applications" class="list-group-item list-group-item-action <?= $page === 'applications' ? 'active' : '' ?>">Việc đã ứng tuyển</a>
                 <a href="<?= e(BASE_URL) ?>/candidate/index.php?page=notifications" class="list-group-item list-group-item-action <?= $page === 'notifications' ? 'active' : '' ?>">Thông báo</a>
+                <a href="<?= e(BASE_URL) ?>/candidate/index.php?page=chat" class="list-group-item list-group-item-action <?= $page === 'chat' ? 'active' : '' ?>"><i class="fa-solid fa-comments me-2 text-primary"></i>Tin nhắn</a>
+                <a href="<?= e(BASE_URL) ?>/candidate/index.php?page=chatbot" class="list-group-item list-group-item-action <?= $page === 'chatbot' ? 'active' : '' ?>"><i class="fa-solid fa-robot me-2 text-success"></i>JobBot</a>
             </div>
         </div>
     </div>

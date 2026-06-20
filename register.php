@@ -111,10 +111,10 @@ render_header('Đăng ký tài khoản');
 $token = csrf_token();
 ?>
 
-<div class="row justify-content-center">
-    <div class="col-lg-7">
-        <div class="app-card p-4">
-            <h3 class="mb-3"><i class="fa-solid fa-user-plus me-2"></i>Đăng ký</h3>
+<div class="auth-page-card py-2">
+    <div class="app-card p-4">
+            <h2 class="mb-1 fw-bold">Tạo tài khoản mới</h2>
+            <p class="auth-subtitle mb-4">Tham gia cùng hàng nghìn ứng viên và nhà tuyển dụng.</p>
             <form method="POST" enctype="multipart/form-data" id="registerForm">
                 <input type="hidden" name="csrf" value="<?= e($token) ?>">
 
@@ -181,7 +181,6 @@ $token = csrf_token();
                 <span class="muted">Đã có tài khoản?</span>
                 <a href="<?= e(BASE_URL) ?>/login.php" class="ms-1">Đăng nhập</a>
             </div>
-        </div>
     </div>
 </div>
 

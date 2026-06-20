@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+// Không echo/print trong file này — tránh lỗi "headers already sent" khi redirect.
+
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'config.php';
 
 /**

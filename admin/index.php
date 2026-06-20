@@ -16,20 +16,23 @@ try {
         $action = $_POST['action'] ?? '';
         verify_csrf();
 
-        // ──────────────────────────────────────────────────────────────────────────────────────────────────
-        if ($action === 'reset_user_password') {
+        // GỬI CẢNH BÁO
+        if ($action === 'send_warning_user') {
             $userId  = (int)($_POST['user_id'] ?? 0);
-            $newPass = (string)($_POST['new_password'] ?? '');
-            if ($userId <= 0 || $newPass === '') {
-                throw new RuntimeException('Dữ liệu đầu vào không hợp lệ.');
-            }
-            $pdo->prepare('UPDATE users SET password = :pw WHERE id = :id')
-                ->execute([':pw' => password_hash($newPass, PASSWORD_DEFAULT), ':id' => $userId]);
-            flash('Đổi mật khẩu thành công.', 'success');
+            $warningContent = trim((string)($_POST['warning_content'] ?? ''));
+
+            if ($userId <= 0) throw new RuntimeException('Mã người dùng không hợp lệ.');
+            if ($warningContent === '') throw new RuntimeException('Vui lòng nhập nội dung cảnh báo.');
+
+            $finalNotif = '⚠️ [CẢNH BÁO TỪ ADMIN]: ' . $warningContent;
+            $pdo->prepare('INSERT INTO notifications (user_id, content) VALUES (:uid, :content)')
+                ->execute([':uid' => $userId, ':content' => $finalNotif]);
+
+            flash('Đã gửi cảnh báo tới tài khoản thành công.', 'success');
             redirect('/admin/index.php?page=users');
         }
 
-        // ──────────────────────────────────────────────────────────────────────────────────────────────────
+        // DUYỆT / TỪ CHỐI JOB
         if ($action === 'approve_job') {
             $jobId  = (int)($_POST['job_id'] ?? 0);
             $status = trim((string)($_POST['status'] ?? ''));
@@ -37,7 +40,6 @@ try {
             if ($jobId <= 0) throw new RuntimeException('Mã việc làm không hợp lệ.');
             if (!in_array($status, ['approved', 'rejected'], true)) throw new RuntimeException('Trạng thái không hợp lệ.');
 
-            // Lấy thông tin job
             $stmt = $pdo->prepare('SELECT j.company_id, j.title FROM jobs j WHERE j.id = :id');
             $stmt->execute([':id' => $jobId]);
             $job = $stmt->fetch();
@@ -45,7 +47,6 @@ try {
 
             $rejectReason = trim((string)($_POST['reject_reason'] ?? ''));
 
-            // Cập nhật trạng thái + Lưu lý do từ chối vào cột rejection_reason của jobs
             $pdo->prepare('UPDATE jobs SET status = :st, rejection_reason = :reason WHERE id = :id')
                 ->execute([
                     ':st'     => $status,
@@ -53,7 +54,6 @@ try {
                     ':id'     => $jobId,
                 ]);
 
-            // Tìm employer để gửi thông báo
             $emStmt = $pdo->prepare('SELECT user_id FROM employers WHERE company_id = :cid LIMIT 1');
             $emStmt->execute([':cid' => (int)$job['company_id']]);
             $em = $emStmt->fetch();
@@ -65,11 +65,8 @@ try {
                 if ($status === 'approved') {
                     $notif = '✅ Tin tuyển dụng "' . $jobTitle . '" đã được admin duyệt và hiển thị công khai.';
                 } else {
-                    // Thông báo kèm lý do và hướng dẫn đăng lại
                     $notif = '❌ Tin tuyển dụng "' . $jobTitle . '" đã bị từ chối.';
-                    if ($rejectReason !== '') {
-                        $notif .= ' Lý do: ' . $rejectReason . '.';
-                    }
+                    if ($rejectReason !== '') $notif .= ' Lý do: ' . $rejectReason . '.';
                     $notif .= ' Bạn có thể chỉnh sửa và đăng lại từ trang Việc làm.';
                 }
 
@@ -81,7 +78,7 @@ try {
             redirect('/admin/index.php?page=jobs');
         }
 
-        // ──────────────────────────────────────────────────────────────────────────────────────────────────
+        // DANH MỤC
         if ($action === 'add_category') {
             $name = trim((string)($_POST['name'] ?? ''));
             if ($name === '') throw new RuntimeException('Tên danh mục là bắt buộc.');
@@ -120,26 +117,46 @@ try {
     redirect('/admin/index.php');
 }
 
+// =================================================================================
+// LẤY DỮ LIỆU HIỂN THỊ
+// =================================================================================
 
+// ---- 1. JOBS CHỜ DUYỆT ----
 $pendingJobs = $pdo->query('
     SELECT j.*, c.name AS company_name, c.address AS company_address,
-           cb.province, cb.address_detail, cb.full_address,
-           COALESCE(NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""), NULLIF(cb.province, ""), NULLIF(c.address, "")) AS location_label
-    FROM jobs j JOIN companies c ON c.id = j.company_id
+           cb.address_detail, cb.full_address,
+           COALESCE(p.name, cb.legacy_province, "") AS province_display,
+           COALESCE(
+               NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""),
+               NULLIF(p.name, ""), NULLIF(cb.legacy_province, ""),
+               NULLIF(c.address, "")
+           ) AS location_label
+    FROM jobs j 
+    JOIN companies c ON c.id = j.company_id
     LEFT JOIN company_branches cb ON cb.id = j.branch_id
+    LEFT JOIN provinces p ON p.id = cb.province_id
     WHERE j.status = "pending"
     ORDER BY j.id DESC
 ')->fetchAll();
 
+// ---- 2. TẤT CẢ JOBS (dùng cho "Tất cả việc làm") ----
 $allJobs = $pdo->query('
     SELECT j.*, c.name AS company_name, c.address AS company_address,
-           cb.province, cb.address_detail, cb.full_address,
-           COALESCE(NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""), NULLIF(cb.province, ""), NULLIF(c.address, "")) AS location_label
-    FROM jobs j JOIN companies c ON c.id = j.company_id
+           cb.address_detail, cb.full_address,
+           COALESCE(p.name, cb.legacy_province, "") AS province_display,
+           COALESCE(
+               NULLIF(cb.full_address, ""), NULLIF(cb.address_detail, ""),
+               NULLIF(p.name, ""), NULLIF(cb.legacy_province, ""),
+               NULLIF(c.address, "")
+           ) AS location_label
+    FROM jobs j 
+    JOIN companies c ON c.id = j.company_id
     LEFT JOIN company_branches cb ON cb.id = j.branch_id
+    LEFT JOIN provinces p ON p.id = cb.province_id
     ORDER BY j.id DESC
 ')->fetchAll();
 
+// ---- 3. NGƯỜI DÙNG & DANH MỤC ----
 $users      = $pdo->query('SELECT id, name, email, role, avatar FROM users ORDER BY id DESC')->fetchAll();
 $categories = $pdo->query('SELECT id, name FROM categories ORDER BY name ASC')->fetchAll();
 
@@ -155,7 +172,6 @@ render_header('Trang quản trị');
 ?>
 
 <div class="row g-4">
-    <!-- Sidebar -->
     <div class="col-lg-3">
         <div class="app-card p-3">
             <div class="p-3 soft-border rounded-14 bg-white">
@@ -180,29 +196,21 @@ render_header('Trang quản trị');
         </div>
     </div>
 
-    <!-- Main content -->
     <div class="col-lg-9">
-
         <?php if ($page === 'dashboard'): ?>
             <?php
-            // Đếm jobs theo trạng thái cho biểu đồ
-            $jobStats = $pdo->query("
-                SELECT status, COUNT(*) as cnt FROM jobs GROUP BY status
-            ")->fetchAll(PDO::FETCH_KEY_PAIR);
+            $jobStats = $pdo->query("SELECT status, COUNT(*) as cnt FROM jobs GROUP BY status")->fetchAll(PDO::FETCH_KEY_PAIR);
             $statPending  = (int)($jobStats['pending']  ?? 0);
             $statApproved = (int)($jobStats['approved'] ?? 0);
             $statRejected = (int)($jobStats['rejected'] ?? 0);
             ?>
-            <!-- Tổng quan -->
             <div class="app-card p-4">
                 <h4 class="mb-3"><i class="fa-solid fa-gauge-high me-2"></i>Tổng quan</h4>
                 <div class="row g-3">
                     <div class="col-md-4">
                         <div class="app-card p-3 soft-border bg-white">
                             <div class="muted small">Việc làm chờ duyệt</div>
-                            <div class="fs-4 fw-bold <?= count($pendingJobs) > 0 ? 'text-danger' : '' ?>">
-                                <?= count($pendingJobs) ?>
-                            </div>
+                            <div class="fs-4 fw-bold <?= count($pendingJobs) > 0 ? 'text-danger' : '' ?>"><?= count($pendingJobs) ?></div>
                         </div>
                     </div>
                     <div class="col-md-4">
@@ -218,8 +226,6 @@ render_header('Trang quản trị');
                         </div>
                     </div>
                 </div>
-
-                <!-- Biểu đồ tỷ lệ việc làm theo trạng thái -->
                 <div class="row g-3 mt-2">
                     <div class="col-md-5">
                         <div class="app-card p-4 soft-border text-center">
@@ -236,83 +242,53 @@ render_header('Trang quản trị');
                         <div class="app-card p-4 soft-border h-100 d-flex flex-column justify-content-center">
                             <h6 class="mb-3"><i class="fa-solid fa-info-circle me-2"></i>Tóm tắt hệ thống</h6>
                             <ul class="list-unstyled mb-0">
-                                <li class="py-2 border-bottom" style="border-color:var(--border)!important">
-                                    <span class="muted small">Tổng việc làm</span>
-                                    <span class="float-end fw-bold"><?= $statPending + $statApproved + $statRejected ?></span>
-                                </li>
-                                <li class="py-2 border-bottom" style="border-color:var(--border)!important">
-                                    <span class="muted small">Người dùng</span>
-                                    <span class="float-end fw-bold"><?= count($users) ?></span>
-                                </li>
-                                <li class="py-2">
-                                    <span class="muted small">Danh mục</span>
-                                    <span class="float-end fw-bold"><?= count($categories) ?></span>
-                                </li>
+                                <li class="py-2 border-bottom"><span class="muted small">Tổng việc làm</span><span class="float-end fw-bold"><?= $statPending + $statApproved + $statRejected ?></span></li>
+                                <li class="py-2 border-bottom"><span class="muted small">Người dùng</span><span class="float-end fw-bold"><?= count($users) ?></span></li>
+                                <li class="py-2"><span class="muted small">Danh mục</span><span class="float-end fw-bold"><?= count($categories) ?></span></li>
                             </ul>
                         </div>
                     </div>
                 </div>
             </div>
-
             <script>
                 document.addEventListener('DOMContentLoaded', function() {
-    const isDark = document.body.classList.contains('dark-mode');
-    const gridColor = isDark ? 'rgba(255,255,255,.1)' : 'rgba(0,0,0,.05)';
-    const textColor = isDark ? '#c8cfe0' : '#6b7280';
-
-    const ctx = document.getElementById('jobStatusChart');
-    if (!ctx) return;
-    new Chart(ctx, {
-        type: 'pie',
-        data: {
-            labels: ['Chờ duyệt', 'Đã duyệt', 'Từ chối'],
-            datasets: [{
-                data: [<?= $statPending ?>, <?= $statApproved ?>, <?= $statRejected ?>],
-                backgroundColor: ['#f59e0b', '#10b981', '#ef4444'],
-                borderWidth: 2,
-                borderColor: isDark ? '#1a1d27' : '#fff'
-            }]
-        },
-        options: {
-            responsive: true,
-            plugins: {
-                legend: { display: false },
-                tooltip: {
-                    callbacks: {
-                        label: ctx => ` ${ctx.label}: ${ctx.raw} việc làm`
-                    }
-                }
-            }
-        }
-    });
-});
-</script>
+                    const isDark = document.body.classList.contains('dark-mode');
+                    const ctx = document.getElementById('jobStatusChart');
+                    if (!ctx) return;
+                    new Chart(ctx, {
+                        type: 'pie',
+                        data: {
+                            labels: ['Chờ duyệt', 'Đã duyệt', 'Từ chối'],
+                            datasets: [{
+                                data: [<?= $statPending ?>, <?= $statApproved ?>, <?= $statRejected ?>],
+                                backgroundColor: ['#f59e0b', '#10b981', '#ef4444'],
+                                borderWidth: 2,
+                                borderColor: isDark ? '#1a1d27' : '#fff'
+                            }]
+                        },
+                        options: { responsive: true, plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ` ${ctx.label}: ${ctx.raw} việc làm` } } } }
+                    });
+                });
+            </script>
 
         <?php elseif ($page === 'jobs'): ?>
-            <!-- Duyệt việc làm -->
             <div class="app-card p-4">
                 <div class="d-flex justify-content-between align-items-center mb-4">
                     <h4 class="mb-0"><i class="fa-solid fa-list-check me-2"></i>Duyệt / từ chối việc làm</h4>
-                    <a class="btn btn-outline-success btn-sm"
-                       href="<?= e(BASE_URL) ?>/admin/index.php?page=jobs&show=<?= ($_GET['show'] ?? '') === 'all' ? '' : 'all' ?>">
+                    <a class="btn btn-outline-success btn-sm" href="<?= e(BASE_URL) ?>/admin/index.php?page=jobs&show=<?= ($_GET['show'] ?? '') === 'all' ? '' : 'all' ?>">
                         <?= ($_GET['show'] ?? '') === 'all' ? '⏳ Chỉ chờ duyệt' : '📋 Tất cả việc làm' ?>
                     </a>
                 </div>
-
                 <?php
                 $showAll = ($_GET['show'] ?? '') === 'all';
                 $list    = $showAll ? $allJobs : $pendingJobs;
                 ?>
-
                 <?php if (empty($list)): ?>
                     <div class="alert alert-success">✅ Không có việc làm nào đang chờ duyệt.</div>
                 <?php endif; ?>
-
                 <div class="d-flex flex-column gap-3">
                     <?php foreach ($list as $job): ?>
                         <div class="app-card p-4 soft-border bg-white">
-
-                            <!-- Header: tên job + badge trạng thái -->
                             <div class="d-flex justify-content-between align-items-start gap-3">
                                 <div>
                                     <div class="fw-bold fs-5"><?= e((string)$job['title']) ?></div>
@@ -329,59 +305,35 @@ render_header('Trang quản trị');
                                 </div>
                                 <?php
                                 [$badgeCls, $badgeLabel] = match($job['status'] ?? '') {
-                                    'approved' => ['bg-success',        '✅ Đã duyệt'],
-                                    'rejected' => ['bg-danger',         '❌ Từ chối'],
-                                    default    => ['bg-warning text-dark','⏳ Chờ duyệt'],
+                                    'approved' => ['bg-success', '✅ Đã duyệt'],
+                                    'rejected' => ['bg-danger', '❌ Từ chối'],
+                                    default    => ['bg-warning text-dark', '⏳ Chờ duyệt'],
                                 };
                                 ?>
                                 <span class="badge <?= $badgeCls ?> px-3 py-2 fs-6 flex-shrink-0"><?= $badgeLabel ?></span>
                             </div>
-
-                            <!-- Lý do từ chối cũ (nếu có) -->
                             <?php if (($job['status'] ?? '') === 'rejected' && !empty($job['rejection_reason'])): ?>
-                                <div class="alert alert-warning py-2 mt-3 mb-0">
-                                    <i class="fa-solid fa-triangle-exclamation me-1"></i>
-                                    Lý do từ chối trước: <strong><?= e((string)$job['rejection_reason']) ?></strong>
-                                </div>
+                                <div class="alert alert-warning py-2 mt-3 mb-0"><i class="fa-solid fa-triangle-exclamation me-1"></i> Lý do từ chối trước: <strong><?= e((string)$job['rejection_reason']) ?></strong></div>
                             <?php endif; ?>
-
-                            <!-- Khu vực action -->
                             <div class="mt-3 d-flex gap-2 align-items-end flex-wrap">
-
-                                <!-- Nút Duyệt -->
-                                <form method="POST"
-                                      onsubmit="return confirm('Duyệt tin tuyển dụng «<?= e((string)$job['title']) ?>»?')">
-                                    <input type="hidden" name="csrf"   value="<?= e(csrf_token()) ?>">
+                                <form method="POST" onsubmit="return confirm('Duyệt tin tuyển dụng «<?= e((string)$job['title']) ?>»?')">
+                                    <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
                                     <input type="hidden" name="action" value="approve_job">
                                     <input type="hidden" name="job_id" value="<?= (int)$job['id'] ?>">
                                     <input type="hidden" name="status" value="approved">
-                                    <button class="btn btn-success" type="submit">
-                                        <i class="fa-solid fa-check me-1"></i>Duyệt
-                                    </button>
+                                    <button class="btn btn-success" type="submit"><i class="fa-solid fa-check me-1"></i>Duyệt</button>
                                 </form>
-
-                                <!-- Từ chối kèm ô nhập lý do -->
-                                <form method="POST" class="d-flex gap-2 align-items-end flex-grow-1"
-                                      onsubmit="return confirm('Từ chối tin tuyển dụng này?')">
-                                    <input type="hidden" name="csrf"   value="<?= e(csrf_token()) ?>">
+                                <form method="POST" class="d-flex gap-2 align-items-end flex-grow-1" onsubmit="return confirm('Từ chối tin tuyển dụng này?')">
+                                    <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
                                     <input type="hidden" name="action" value="approve_job">
                                     <input type="hidden" name="job_id" value="<?= (int)$job['id'] ?>">
                                     <input type="hidden" name="status" value="rejected">
                                     <div class="flex-grow-1">
-                                        <label class="form-label mb-1" style="font-size:.82rem">
-                                            Lý do từ chối
-                                            <span class="muted">(không bắt buộc — nhà tuyển dụng sẽ nhận được)</span>
-                                        </label>
-                                        <input class="form-control form-control-sm"
-                                               name="reject_reason"
-                                               placeholder="Vi phạm quy định, thông tin không đầy đủ, nội dung không phù hợp..."
-                                               value="<?= e((string)($job['rejection_reason'] ?? '')) ?>">
+                                        <label class="form-label mb-1" style="font-size:.82rem">Lý do từ chối <span class="muted">(không bắt buộc)</span></label>
+                                        <input class="form-control form-control-sm" name="reject_reason" placeholder="Vi phạm quy định, thông tin không đầy đủ..." value="<?= e((string)($job['rejection_reason'] ?? '')) ?>">
                                     </div>
-                                    <button class="btn btn-outline-danger" type="submit">
-                                        <i class="fa-solid fa-xmark me-1"></i>Từ chối
-                                    </button>
+                                    <button class="btn btn-outline-danger" type="submit"><i class="fa-solid fa-xmark me-1"></i>Từ chối</button>
                                 </form>
-
                             </div>
                         </div>
                     <?php endforeach; ?>
@@ -389,33 +341,27 @@ render_header('Trang quản trị');
             </div>
 
         <?php elseif ($page === 'users'): ?>
-            <!-- Quản lý người dùng -->
             <div class="app-card p-4">
-                <h4 class="mb-3"><i class="fa-solid fa-users me-2"></i>Quản lý người dùng</h4>
+                <h4 class="mb-3"><i class="fa-solid fa-users me-2"></i>Danh sách người dùng hệ thống</h4>
                 <div class="row g-3">
                     <?php foreach ($users as $u): ?>
                         <div class="col-md-6">
                             <div class="app-card p-3 soft-border bg-white h-100">
                                 <div class="d-flex justify-content-between align-items-start gap-2">
-                                    <div>
-                                        <div class="fw-bold"><?= e((string)$u['name']) ?></div>
-                                        <div class="muted small"><?= e((string)$u['email']) ?></div>
-                                    </div>
+                                    <div><div class="fw-bold"><?= e((string)$u['name']) ?></div><div class="muted small"><?= e((string)$u['email']) ?></div></div>
                                     <span class="badge text-bg-light soft-border"><?= e((string)$u['role']) ?></span>
                                 </div>
                                 <div class="mt-3">
-                                    <form method="POST" class="row g-2 align-items-end">
-                                        <input type="hidden" name="csrf"    value="<?= e(csrf_token()) ?>">
-                                        <input type="hidden" name="action"  value="reset_user_password">
+                                    <form method="POST" class="row g-2 align-items-end" onsubmit="return confirm('Bạn chắc chắn muốn gửi cảnh báo tới người dùng «<?= e((string)$u['name']) ?>» chứ?')">
+                                        <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
+                                        <input type="hidden" name="action" value="send_warning_user">
                                         <input type="hidden" name="user_id" value="<?= (int)$u['id'] ?>">
-                                        <div class="col-7">
-                                            <label class="form-label">Mật khẩu mới</label>
-                                            <input class="form-control" type="password" name="new_password" value="123456" required>
+                                        <div class="col-8">
+                                            <label class="form-label text-warning fw-bold" style="font-size:0.85rem;"><i class="fa-solid fa-circle-exclamation me-1"></i>Nội dung cảnh báo vi phạm</label>
+                                            <input class="form-control form-control-sm" type="text" name="warning_content" placeholder="Ví dụ: Tài khoản bị tố cáo có hành vi lừa đảo..." required>
                                         </div>
-                                        <div class="col-5">
-                                            <button class="btn btn-success w-100" type="submit">
-                                                <i class="fa-solid fa-key me-2"></i>Đặt lại
-                                            </button>
+                                        <div class="col-4">
+                                            <button class="btn btn-warning btn-sm w-100 text-dark fw-bold" type="submit"><i class="fa-solid fa-paper-plane me-1"></i>Gửi</button>
                                         </div>
                                     </form>
                                 </div>
@@ -426,48 +372,33 @@ render_header('Trang quản trị');
             </div>
 
         <?php elseif ($page === 'categories'): ?>
-            <!-- Danh mục -->
             <div class="app-card p-4">
                 <h4 class="mb-3"><i class="fa-solid fa-tags me-2"></i>Quản lý Danh mục</h4>
-
                 <?php if ($editCategory): ?>
                     <div class="app-card p-3 soft-border bg-white mb-4">
                         <h5 class="mb-3">Sửa Danh mục</h5>
                         <form method="POST">
-                            <input type="hidden" name="csrf"        value="<?= e(csrf_token()) ?>">
-                            <input type="hidden" name="action"      value="edit_category">
+                            <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
+                            <input type="hidden" name="action" value="edit_category">
                             <input type="hidden" name="category_id" value="<?= (int)$editCategory['id'] ?>">
                             <div class="row g-2 align-items-end">
-                                <div class="col-md-8">
-                                    <label class="form-label">Tên</label>
-                                    <input class="form-control" name="name" value="<?= e((string)$editCategory['name']) ?>" required>
-                                </div>
-                                <div class="col-md-4 d-flex gap-2">
-                                    <button class="btn btn-success w-100" type="submit"><i class="fa-solid fa-floppy-disk me-2"></i>Lưu</button>
-                                    <a class="btn btn-outline-secondary" href="<?= e(BASE_URL) ?>/admin/index.php?page=categories">Hủy</a>
-                                </div>
+                                <div class="col-md-8"><label class="form-label">Tên</label><input class="form-control" name="name" value="<?= e((string)$editCategory['name']) ?>" required></div>
+                                <div class="col-md-4 d-flex gap-2"><button class="btn btn-success w-100" type="submit"><i class="fa-solid fa-floppy-disk me-2"></i>Lưu</button><a class="btn btn-outline-secondary" href="<?= e(BASE_URL) ?>/admin/index.php?page=categories">Hủy</a></div>
                             </div>
                         </form>
                     </div>
                 <?php endif; ?>
-
                 <div class="app-card p-3 soft-border bg-white mb-4">
                     <h5 class="mb-3">Thêm Danh mục</h5>
                     <form method="POST">
-                        <input type="hidden" name="csrf"   value="<?= e(csrf_token()) ?>">
+                        <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
                         <input type="hidden" name="action" value="add_category">
                         <div class="row g-2 align-items-end">
-                            <div class="col-md-8">
-                                <label class="form-label">Tên</label>
-                                <input class="form-control" name="name" required placeholder="Ví dụ IT, Marketing">
-                            </div>
-                            <div class="col-md-4">
-                                <button class="btn btn-success w-100" type="submit"><i class="fa-solid fa-plus me-2"></i>Thêm</button>
-                            </div>
+                            <div class="col-md-8"><label class="form-label">Tên</label><input class="form-control" name="name" required placeholder="Ví dụ IT, Marketing"></div>
+                            <div class="col-md-4"><button class="btn btn-success w-100" type="submit"><i class="fa-solid fa-plus me-2"></i>Thêm</button></div>
                         </div>
                     </form>
                 </div>
-
                 <div class="row g-3">
                     <?php foreach ($categories as $cat): ?>
                         <div class="col-md-6">
@@ -475,18 +406,12 @@ render_header('Trang quản trị');
                                 <div class="d-flex justify-content-between align-items-center">
                                     <div class="fw-bold"><?= e((string)$cat['name']) ?></div>
                                     <div class="d-flex gap-2">
-                                        <a class="btn btn-outline-success btn-sm"
-                                           href="<?= e(BASE_URL) ?>/admin/index.php?page=categories&id=<?= (int)$cat['id'] ?>">
-                                            <i class="fa-solid fa-pen me-1"></i>Sửa
-                                        </a>
-                                        <form method="POST" style="display:inline-block;"
-                                              onsubmit="return confirm('Xóa Danh mục «<?= e((string)$cat['name']) ?>»?')">
-                                            <input type="hidden" name="csrf"        value="<?= e(csrf_token()) ?>">
-                                            <input type="hidden" name="action"      value="delete_category">
+                                        <a class="btn btn-outline-success btn-sm" href="<?= e(BASE_URL) ?>/admin/index.php?page=categories&id=<?= (int)$cat['id'] ?>"><i class="fa-solid fa-pen me-1"></i>Sửa</a>
+                                        <form method="POST" style="display:inline-block;" onsubmit="return confirm('Xóa Danh mục «<?= e((string)$cat['name']) ?>»?')">
+                                            <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
+                                            <input type="hidden" name="action" value="delete_category">
                                             <input type="hidden" name="category_id" value="<?= (int)$cat['id'] ?>">
-                                            <button class="btn btn-outline-danger btn-sm" type="submit">
-                                                <i class="fa-solid fa-trash me-1"></i>Xóa
-                                            </button>
+                                            <button class="btn btn-outline-danger btn-sm" type="submit"><i class="fa-solid fa-trash me-1"></i>Xóa</button>
                                         </form>
                                     </div>
                                 </div>
@@ -495,7 +420,6 @@ render_header('Trang quản trị');
                     <?php endforeach; ?>
                 </div>
             </div>
-
         <?php endif; ?>
     </div>
 </div>
